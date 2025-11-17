@@ -1696,27 +1696,15 @@ private:
                 return;
             }
 
-            // 等待连接结束（带超时保护）
-            const int MAX_WAIT_SECONDS = 300;  // 最大等待5分钟
-            int wait_count = 0;
-
+            // v12.3.15修复: 移除300秒硬超时，改用无限期等待 + TCP keepalive/心跳机制检测真正断线
+            // 原bug: 无论玩家是否活跃，300秒后强制关闭，导致正常游戏被断开连接
+            // 新策略:
+            //   1. 不设硬性时间限制，依靠协议自然结束
+            //   2. TCP keepalive会自动检测网络断开
+            //   3. 游戏/客户端主动关闭会触发FIN，自然结束连接
+            //   4. 僵尸连接由操作系统TCP层的keepalive机制处理
             while (conn->is_running()) {
                 this_thread::sleep_for(chrono::seconds(1));
-                wait_count++;
-
-                // 超时保护：防止僵尸连接
-                if (wait_count >= MAX_WAIT_SECONDS) {
-                    Logger::warning("[连接" + to_string(conn_id) + "|" + session_uuid +
-                                  "] 等待连接结束超时(" + to_string(MAX_WAIT_SECONDS) + "秒)，强制关闭");
-                    conn->stop();  // 强制停止
-                    break;
-                }
-
-                // 每60秒输出一次等待状态
-                if (wait_count % 60 == 0) {
-                    Logger::debug("[连接" + to_string(conn_id) + "|" + session_uuid +
-                                "] 等待连接结束中... (" + to_string(wait_count) + "秒)");
-                }
             }
 
             Logger::info("[连接" + to_string(conn_id) + "|" + session_uuid + "] 连接已结束，开始清理资源");
