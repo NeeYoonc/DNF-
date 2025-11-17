@@ -266,6 +266,77 @@ private:
     static mutex log_mutex;
     static bool file_enabled;
     static string current_log_level;
+    static string log_dir;           // 日志目录
+    static string current_date;      // 当前日志日期 (格式: YYYYMMDD)
+    static bool auto_rotate;         // 是否启用自动日志轮转
+
+    // 获取当前日期字符串 (北京时间)
+    static string get_current_date() {
+        auto now = chrono::system_clock::now();
+        auto beijing_time = chrono::system_clock::to_time_t(now + chrono::hours(8));
+        stringstream ss;
+        ss << put_time(gmtime(&beijing_time), "%Y%m%d");
+        return ss.str();
+    }
+
+    // 生成日志文件名
+    static string generate_log_filename(const string& date) {
+        return log_dir + "/server_log_" + date + ".txt";
+    }
+
+    // 轮转日志文件
+    static void rotate_log_file() {
+        string new_date = get_current_date();
+
+        if (new_date == current_date) {
+            return;  // 日期未变化，无需轮转
+        }
+
+        // 关闭旧日志文件
+        if (log_file.is_open()) {
+            stringstream ss;
+            auto now = chrono::system_clock::now();
+            auto beijing_time = chrono::system_clock::to_time_t(now + chrono::hours(8));
+            auto ms = chrono::duration_cast<chrono::milliseconds>(
+                now.time_since_epoch()) % 1000;
+
+            ss << put_time(gmtime(&beijing_time), "%Y-%m-%d %H:%M:%S")
+               << "." << setfill('0') << setw(3) << ms.count()
+               << " [INFO] 日志文件轮转: 关闭旧日志，日期从 " << current_date << " 切换到 " << new_date;
+
+            string log_line = ss.str();
+            log_file << log_line << endl;
+            log_file.flush();
+            log_file.close();
+
+            cout << log_line << endl;
+        }
+
+        // 打开新日志文件
+        current_date = new_date;
+        string new_filename = generate_log_filename(current_date);
+        log_file.open(new_filename, ios::out | ios::app);
+
+        if (log_file.is_open()) {
+            auto now = chrono::system_clock::now();
+            auto beijing_time = chrono::system_clock::to_time_t(now + chrono::hours(8));
+            auto ms = chrono::duration_cast<chrono::milliseconds>(
+                now.time_since_epoch()) % 1000;
+
+            stringstream ss;
+            ss << put_time(gmtime(&beijing_time), "%Y-%m-%d %H:%M:%S")
+               << "." << setfill('0') << setw(3) << ms.count()
+               << " [INFO] 新日志文件已创建(北京时间): " << new_filename;
+
+            string log_line = ss.str();
+            cout << log_line << endl;
+            log_file << log_line << endl;
+            log_file.flush();
+        } else {
+            cerr << "错误: 无法创建新日志文件: " << new_filename << endl;
+            file_enabled = false;
+        }
+    }
 
 public:
     static void set_log_level(const string& level) {
@@ -273,7 +344,22 @@ public:
     }
 
     static void init(const string& filename) {
-        log_file.open(filename, ios::out | ios::app);
+        // 从文件名中提取日志目录
+        size_t last_slash = filename.find_last_of("/\\");
+        if (last_slash != string::npos) {
+            log_dir = filename.substr(0, last_slash);
+        } else {
+            log_dir = "log";  // 默认目录
+        }
+
+        // 启用自动轮转
+        auto_rotate = true;
+        current_date = get_current_date();
+
+        // 使用日期命名的日志文件
+        string dated_filename = generate_log_filename(current_date);
+
+        log_file.open(dated_filename, ios::out | ios::app);
         if (log_file.is_open()) {
             file_enabled = true;
             // 不能在这里调用log()因为会死锁，直接输出
@@ -286,14 +372,14 @@ public:
             stringstream ss;
             ss << put_time(gmtime(&beijing_time), "%Y-%m-%d %H:%M:%S")
                << "." << setfill('0') << setw(3) << ms.count()
-               << " [INFO] 日志文件已初始化(北京时间): " << filename;
+               << " [INFO] 日志文件已初始化(北京时间, 自动按天分割): " << dated_filename;
 
             string log_line = ss.str();
             cout << log_line << endl;
             log_file << log_line << endl;
             log_file.flush();
         } else {
-            cerr << "警告: 无法打开日志文件: " << filename << endl;
+            cerr << "警告: 无法打开日志文件: " << dated_filename << endl;
         }
     }
 
@@ -354,6 +440,12 @@ private:
 
         // 输出到控制台和文件
         lock_guard<mutex> lock(log_mutex);
+
+        // 检查是否需要轮转日志文件（每天0点自动切换）
+        if (auto_rotate && file_enabled) {
+            rotate_log_file();
+        }
+
         cout << log_line << endl;
         if (file_enabled && log_file.is_open()) {
             log_file << log_line << endl;
@@ -367,6 +459,9 @@ ofstream Logger::log_file;
 mutex Logger::log_mutex;
 bool Logger::file_enabled = false;
 string Logger::current_log_level = "INFO";
+string Logger::log_dir = "log";
+string Logger::current_date = "";
+bool Logger::auto_rotate = true;
 
 // ==================== IP替换辅助函数 ====================
 // 在payload中查找并替换IP地址(支持大端序和小端序)
@@ -1394,6 +1489,10 @@ public:
         }
     }
 
+    bool is_running() const {
+        return running;
+    }
+
 private:
     void accept_loop() {
         while (running) {
@@ -2416,12 +2515,143 @@ bool generate_default_config(const string& filename) {
     return true;
 }
 
+// ==================== 全局服务器实例管理 ====================
+// 全局变量：所有运行中的 TunnelServer 实例
+struct RunningServer {
+    ServerConfig config;
+    shared_ptr<TunnelServer> instance;
+    shared_ptr<std::thread> server_thread;  // 重命名避免命名冲突
+};
+
+vector<RunningServer> g_running_servers;
+mutex g_running_servers_mutex;
+string g_config_file_path;  // 配置文件路径
+
+// 比对配置，查找需要新增/删除的服务器
+void reload_tunnel_servers() {
+    Logger::info("========================================");
+    Logger::info("开始热重载隧道服务器配置...");
+    Logger::info("========================================");
+
+    // 1. 重新加载配置文件
+    if (g_config_file_path.empty()) {
+        Logger::error("配置文件路径未初始化");
+        return;
+    }
+
+    GlobalConfig new_config = load_config(g_config_file_path);
+
+    lock_guard<mutex> lock(g_running_servers_mutex);
+
+    // 2. 构建当前运行服务器的映射 (key: listen_port)
+    map<int, RunningServer*> current_map;
+    for (auto& rs : g_running_servers) {
+        current_map[rs.config.listen_port] = &rs;
+    }
+
+    // 3. 构建新配置的映射
+    map<int, ServerConfig> new_map;
+    for (const auto& cfg : new_config.servers) {
+        new_map[cfg.listen_port] = cfg;
+    }
+
+    // 4. 查找需要新增的服务器
+    int added = 0, removed = 0, modified = 0;
+
+    for (const auto& pair : new_map) {
+        int port = pair.first;
+        const ServerConfig& new_cfg = pair.second;
+
+        if (current_map.find(port) == current_map.end()) {
+            // 新增服务器
+            Logger::info("[热重载] 新增服务器: [" + new_cfg.name + "] 端口:" +
+                        to_string(port) + " → " + new_cfg.game_server_ip);
+
+            auto server = make_shared<TunnelServer>(new_cfg);
+            auto t = make_shared<thread>([server]() {
+                server->start();
+            });
+
+            RunningServer rs;
+            rs.config = new_cfg;
+            rs.instance = server;
+            rs.server_thread = t;
+            g_running_servers.push_back(rs);
+
+            added++;
+        } else {
+            // 检查是否修改
+            RunningServer* current = current_map[port];
+            if (current->config.game_server_ip != new_cfg.game_server_ip ||
+                current->config.name != new_cfg.name) {
+
+                Logger::info("[热重载] 检测到配置修改: [" + new_cfg.name + "] 端口:" + to_string(port));
+                Logger::info("  旧游戏服务器: " + current->config.game_server_ip);
+                Logger::info("  新游戏服务器: " + new_cfg.game_server_ip);
+                Logger::info("  注意: 已有连接仍使用旧配置，新连接将使用新配置");
+                Logger::info("  建议: 如需完全切换，请使用 systemctl restart");
+
+                // 先停止旧实例
+                if (current->instance) {
+                    current->instance->stop();
+                }
+                if (current->server_thread && current->server_thread->joinable()) {
+                    current->server_thread->join();
+                }
+
+                // 启动新实例
+                auto server = make_shared<TunnelServer>(new_cfg);
+                auto t = make_shared<thread>([server]() {
+                    server->start();
+                });
+
+                current->config = new_cfg;
+                current->instance = server;
+                current->server_thread = t;
+
+                modified++;
+            }
+        }
+    }
+
+    // 5. 查找需要删除的服务器
+    vector<RunningServer> new_running_servers;
+    for (auto& rs : g_running_servers) {
+        if (new_map.find(rs.config.listen_port) == new_map.end()) {
+            // 删除服务器
+            Logger::info("[热重载] 删除服务器: [" + rs.config.name + "] 端口:" +
+                        to_string(rs.config.listen_port));
+
+            if (rs.instance) {
+                rs.instance->stop();
+            }
+            if (rs.server_thread && rs.server_thread->joinable()) {
+                rs.server_thread->join();
+            }
+
+            removed++;
+        } else {
+            new_running_servers.push_back(rs);
+        }
+    }
+    g_running_servers = new_running_servers;
+
+    // 6. 也重载 TCP Config Server 的配置
+    reload_tcp_config();
+
+    Logger::info("========================================");
+    Logger::info("热重载完成: 新增" + to_string(added) + "个, 修改" +
+                to_string(modified) + "个, 删除" + to_string(removed) + "个");
+    Logger::info("当前运行服务器数量: " + to_string(g_running_servers.size()));
+    Logger::info("========================================");
+}
+
 // ==================== 信号处理 - 捕获崩溃并记录日志 ====================
 // 使用异步信号安全的函数记录崩溃信息
 void signal_handler(int signum) {
     // SIGHUP: 重新加载配置
     if (signum == SIGHUP) {
-        reload_tcp_config();
+        reload_tunnel_servers();
         return;
     }
 
@@ -2543,6 +2773,9 @@ int main() {
     // 配置文件存在 - 正常加载
     GlobalConfig global_config = load_config(config_file);
 
+    // 保存配置文件路径到全局变量（用于热重载）
+    g_config_file_path = config_file;
+
     // 设置日志级别
     Logger::set_log_level(global_config.log_level);
 
@@ -2559,23 +2792,23 @@ int main() {
     }
     cout << endl;
 
-    // 创建所有TunnelServer实例 - 使用智能指针
-    vector<shared_ptr<TunnelServer>> servers;
-    vector<shared_ptr<thread>> server_threads;
-
-    for (const ServerConfig& srv_cfg : global_config.servers) {
-        auto server = make_shared<TunnelServer>(srv_cfg);
-        servers.push_back(server);
-    }
-
     Logger::info("正在启动所有隧道服务器...");
 
-    // 在独立线程中启动每个服务器
-    for (auto server : servers) {
-        auto t = make_shared<thread>([server]() {
-            server->start();
-        });
-        server_threads.push_back(t);
+    // 创建并启动所有TunnelServer实例，添加到全局管理
+    {
+        lock_guard<mutex> lock(g_running_servers_mutex);
+        for (const ServerConfig& srv_cfg : global_config.servers) {
+            auto server = make_shared<TunnelServer>(srv_cfg);
+            auto t = make_shared<thread>([server]() {
+                server->start();
+            });
+
+            RunningServer rs;
+            rs.config = srv_cfg;
+            rs.instance = server;
+            rs.server_thread = t;
+            g_running_servers.push_back(rs);
+        }
     }
 
     Logger::info("所有隧道服务器已启动");
@@ -2605,14 +2838,28 @@ int main() {
     cout << endl;
     cout << "服务器正在运行..." << endl;
     cout << "  • 停止服务器: Ctrl+C 或 kill <pid>" << endl;
-    cout << "  • 热重载配置: kill -HUP <pid>" << endl;
+    cout << "  • 热重载配置: kill -HUP <pid> (支持动态增删服务器)" << endl;
     cout << "  • 查看进程ID: echo $$" << endl;
     cout << "============================================================" << endl;
 
-    // 等待所有线程
-    for (auto t : server_threads) {
-        if (t->joinable()) {
-            t->join();
+    // 主线程保持运行，等待信号
+    // 注意：热重载时会动态修改 g_running_servers，所以不能简单 join
+    while (true) {
+        sleep(10);  // 每10秒检查一次
+
+        // 检查是否所有服务器都停止了
+        lock_guard<mutex> lock(g_running_servers_mutex);
+        bool all_stopped = true;
+        for (const auto& rs : g_running_servers) {
+            if (rs.instance && rs.instance->is_running()) {
+                all_stopped = false;
+                break;
+            }
+        }
+
+        if (all_stopped && !g_running_servers.empty()) {
+            Logger::info("所有隧道服务器已停止");
+            break;
         }
     }
 
@@ -2624,11 +2871,13 @@ int main() {
         Logger::info("TCP配置服务器已停止");
     }
 
-    // 智能指针自动清理，无需手动delete
-    Logger::info("所有服务器已正常关闭");
-    server_threads.clear();
-    servers.clear();
+    // 清理全局服务器实例
+    {
+        lock_guard<mutex> lock(g_running_servers_mutex);
+        g_running_servers.clear();  // 智能指针自动清理，无需手动delete
+    }
 
+    Logger::info("所有服务器已正常关闭");
     Logger::close();
     return 0;
 }
