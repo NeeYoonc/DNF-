@@ -2,6 +2,19 @@
  * DNF游戏代理客户端 - C++ 版本 v12.4.0 (多服务器版)
  * 从自身exe末尾读取配置，支持HTTP API动态获取服务器列表
  *
+ * v12.3.14 更新 (2025-11-17):
+ * - 🔥 关键修复: TCP握手序列号同步问题，解决频道重选后无法进入游戏
+ * - 问题根因: handle_syn()在SYN-ACK后立即设置client_acked_seq，但游戏客户端尚未确认
+ * - 修复方案: 在handle_ack()三次握手完成时才正确初始化client_acked_seq
+ * - 额外保护: send_window_probe()添加established检查，避免握手未完成时发送探测包
+ * - 预期效果: 频道重选后，TCP序列号正确同步，游戏服务器不再发送RST关闭连接
+ *
+ * v12.3.13 更新 (2025-11-17):
+ * - 🔥 关键修复: TCP重传检测，解决频道重选时"无频道"问题
+ * - 问题根因: 游戏客户端TCP重传（相同seq号）被转发到服务器，导致协议错误
+ * - 修复方案: handle_data()检测seq<server_ack为重传包，忽略数据但发送ACK确认
+ * - 预期效果: 重复数据不再转发，服务器协议正常，频道列表正确显示
+ *
  * v12.4.0 更新 (2025-11-11):
  * - 🎯 新功能: 服务器切换功能 - 启动时从HTTP API获取服务器列表并显示GUI选择窗口
  * - GUI窗口: Win32原生窗口，仿DNF频道选择风格，支持列表选择和双击连接
@@ -1812,8 +1825,9 @@ public:
 
         // SYN标志消耗1个序列号，所以立即增加server_seq
         server_seq += 1;
-        client_acked_seq = server_seq;
-        Logger::debug("[连接" + to_string(conn_id) + "] SYN-ACK已发送，server_seq更新为 " + to_string(server_seq));
+        // v12.3.14: 不要在这里设置client_acked_seq，等待三次握手的ACK确认
+        // client_acked_seq将在handle_ack()中正确初始化
+        Logger::debug("[连接" + to_string(conn_id) + "] SYN-ACK已发送，server_seq更新为 " + to_string(server_seq) + " (等待ACK确认)");
 
         // 启动接收线程
         running = true;
@@ -1865,8 +1879,14 @@ public:
         if (!established && ack == server_seq) {
             established = true;
             client_ack = ack;
-            // server_seq已经在发送SYN-ACK后增加过了，不需要再+1
-            Logger::info("[连接" + to_string(conn_id) + "] ✓ TCP连接已建立 (收到ACK=" + to_string(ack) + ")");
+            // v12.3.14: 在三次握手完成时正确初始化client_acked_seq
+            // 这是游戏客户端确认的序列号，用于计算飞行中的数据量
+            {
+                lock_guard<mutex> lock(send_lock);
+                client_acked_seq = ack;
+            }
+            Logger::info("[连接" + to_string(conn_id) + "] ✓ TCP连接已建立 (收到ACK=" + to_string(ack) +
+                        ", client_acked_seq=" + to_string(client_acked_seq) + ")");
 
             // 连接建立后，尝试发送缓冲区中的数据
             {
@@ -2145,7 +2165,8 @@ private:
 
     void send_window_probe() {
         // v12.3.10: 关闭中不发送探测包，避免FIN后序列号混乱
-        if (closing) return;
+        // v12.3.14: 连接未建立时也不发送探测包，避免序列号不同步
+        if (closing || !established) return;
 
         // 发送1字节窗口探测包，强制接收方回复ACK更新窗口大小
         if (send_buffer.empty())
