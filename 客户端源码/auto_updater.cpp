@@ -375,17 +375,6 @@ bool AutoUpdater::GetLatestMD5(const std::string& api_url, int api_port,
         return false;
     }
 
-    // 调试：打印完整响应
-    {
-        std::ofstream debug_log("update_response_debug.txt");
-        if (debug_log.is_open()) {
-            debug_log << "=== GET_VERSION Response ===" << std::endl;
-            debug_log << response << std::endl;
-            debug_log << "=== Length: " << response.length() << " ===" << std::endl;
-            debug_log.close();
-        }
-    }
-
     // 解析JSON响应
     // 期望格式: {"md5":"abc123...","download_url":"http://..."}
 
@@ -436,7 +425,13 @@ std::string AutoUpdater::CreateUpdateScript(const std::string& download_url,
         exe_dir = "";
     }
 
-    std::string script_path = exe_dir + "dnf_proxy_update.bat";
+    // 从exe文件名提取应用名称（去掉.exe后缀）
+    std::string app_name = exe_name;
+    if (app_name.length() > 4 && app_name.substr(app_name.length() - 4) == ".exe") {
+        app_name = app_name.substr(0, app_name.length() - 4);
+    }
+
+    std::string script_path = exe_dir + app_name + "_update.bat";
 
     // 创建批处理脚本
     std::ofstream script(script_path);
@@ -454,17 +449,14 @@ std::string AutoUpdater::CreateUpdateScript(const std::string& download_url,
 
     script << "@echo off\n";
     script << "chcp 65001 >nul\n";
-    script << "title DNF代理客户端 - 自动更新\n";
+    script << "title 自动更新程序\n";
     script << "color 0A\n";
     script << "echo ============================================\n";
-    script << "echo       DNF代理客户端 自动更新程序\n";
+    script << "echo            自动更新程序\n";
     script << "echo ============================================\n";
     script << "echo.\n";
-    script << "echo 正在等待程序退出...\n";
-    script << "timeout /t 3 /nobreak >nul\n";
-    script << "echo.\n";
-    script << "echo 正在下载更新...\n";
-    script << "echo 下载地址: " << escaped_url << "\n";
+    script << "echo 正在准备更新...\n";
+    script << "timeout /t 2 /nobreak >nul\n";
     script << "echo.\n";
 
     // 批处理脚本已经在exe所在目录，使用 %~dp0 获取脚本目录（也就是exe目录）
@@ -472,24 +464,26 @@ std::string AutoUpdater::CreateUpdateScript(const std::string& download_url,
 
     script << "rem 使用脚本所在目录作为工作目录\n";
     script << "cd /d \"%~dp0\"\n";
-    script << "echo [调试] 工作目录: %CD%\n";
     script << "echo.\n";
 
-    script << "set \"DOWNLOAD_FILE=%TEMP%\\dnf_proxy_update_temp.exe\"\n";
-    script << "echo [调试] 下载路径: %DOWNLOAD_FILE%\n";
-    script << "echo.\n";
+    // 从批处理脚本文件名推断exe文件名（避免中文编码问题）
+    // 批处理脚本名：xxx_update.bat -> exe名：xxx.exe
+    script << "rem 从脚本文件名推断exe文件名\n";
+    script << "set \"SCRIPT_NAME=%~n0\"\n";
+    script << "set \"EXE_NAME=%SCRIPT_NAME:_update=%\"\n";
+    script << "set \"EXE_FILE=%EXE_NAME%.exe\"\n";
+    script << "set \"DOWNLOAD_FILE=%TEMP%\\%SCRIPT_NAME%_temp.exe\"\n";
 
-    // 下载文件到临时目录
-    script << "curl -L --user-agent \"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\" --referer \"" << escaped_url << "\" --location-trusted -o \"%DOWNLOAD_FILE%\" \"" << escaped_url << "\"\n";
+    // 下载文件到临时目录（使用 -s 静默模式，隐藏进度条）
+    script << "echo [1/4] 正在下载更新文件...\n";
+    script << "curl -s -L --user-agent \"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\" --referer \"" << escaped_url << "\" --location-trusted -o \"%DOWNLOAD_FILE%\" \"" << escaped_url << "\"\n";
     script << "if %errorlevel% neq 0 (\n";
     script << "    echo.\n";
-    script << "    echo [错误] 下载失败！错误码: %errorlevel%\n";
-    script << "    echo 请检查网络连接或下载地址。\n";
+    script << "    echo [错误] 下载失败！\n";
     script << "    echo.\n";
     script << "    pause\n";
     script << "    exit /b 1\n";
     script << ")\n";
-    script << "echo.\n";
 
     // 验证下载的文件
     script << "if not exist \"%DOWNLOAD_FILE%\" (\n";
@@ -497,69 +491,62 @@ std::string AutoUpdater::CreateUpdateScript(const std::string& download_url,
     script << "    pause\n";
     script << "    exit /b 1\n";
     script << ")\n";
-    script << "echo.\n";
 
     // 检查文件大小
     script << "for %%F in (\"%DOWNLOAD_FILE%\") do set size=%%~zF\n";
     script << "if %size% LSS 102400 (\n";
-    script << "    echo [错误] 下载的文件太小 ^(%size% 字节^)！\n";
-    script << "    echo 这可能是重定向页面而不是实际的exe文件。\n";
-    script << "    echo.\n";
+    script << "    echo [错误] 下载的文件无效！\n";
     script << "    del /f \"%DOWNLOAD_FILE%\" >nul 2>&1\n";
     script << "    pause\n";
     script << "    exit /b 1\n";
     script << ")\n";
-    script << "echo 下载文件大小: %size% 字节\n";
-    script << "echo.\n";
-    script << "echo 下载完成！正在替换文件...\n";
+    script << "echo      下载完成 ^(文件大小: %size% 字节^)\n";
     script << "echo.\n";
 
     // 检查当前目录下的exe文件
-    script << "if not exist \"" << exe_name << "\" (\n";
-    script << "    echo [错误] 在当前目录找不到程序文件: " << exe_name << "\n";
+    script << "if not exist \"%EXE_FILE%\" (\n";
+    script << "    echo [错误] 找不到程序文件！\n";
     script << "    pause\n";
     script << "    exit /b 1\n";
     script << ")\n";
-    script << "echo.\n";
 
     // 强制结束旧进程
-    script << "echo 正在结束旧进程...\n";
-    script << "taskkill /f /im \"" << exe_name << "\" >nul 2>&1\n";
-    script << "timeout /t 2 /nobreak >nul\n";
+    script << "echo [2/4] 正在停止旧版本程序...\n";
+    script << "taskkill /f /im \"%EXE_FILE%\" >nul 2>&1\n";
+    script << "timeout /t 1 /nobreak >nul\n";
     script << "echo.\n";
 
     // 在当前目录操作文件（使用相对路径，只用文件名）
-    script << "if exist \"" << exe_name << ".bak\" del /f \"" << exe_name << ".bak\" >nul 2>&1\n";
+    script << "if exist \"%EXE_FILE%.bak\" del /f \"%EXE_FILE%.bak\" >nul 2>&1\n";
 
-    script << "echo 备份原文件...\n";
-    script << "ren \"" << exe_name << "\" \"" << exe_name << ".bak\" >nul 2>&1\n";
-    script << "if exist \"" << exe_name << "\" (\n";
-    script << "    echo [错误] 无法重命名原文件，可能仍在运行\n";
+    script << "echo [3/4] 正在安装新版本...\n";
+    script << "ren \"%EXE_FILE%\" \"%EXE_NAME%.exe.bak\" >nul 2>&1\n";
+    script << "if exist \"%EXE_FILE%\" (\n";
+    script << "    echo [错误] 无法替换文件，程序可能仍在运行！\n";
     script << "    pause\n";
     script << "    exit /b 1\n";
     script << ")\n";
-    script << "echo.\n";
 
     // 复制新文件到当前目录
-    script << "echo 复制新文件...\n";
-    script << "copy /y \"%DOWNLOAD_FILE%\" \"" << exe_name << "\" >nul 2>&1\n";
-    script << "if not exist \"" << exe_name << "\" (\n";
-    script << "    echo [错误] 文件复制失败！\n";
-    script << "    echo 尝试恢复备份...\n";
-    script << "    ren \"" << exe_name << ".bak\" \"" << exe_name << "\" >nul 2>&1\n";
+    script << "copy /y \"%DOWNLOAD_FILE%\" \"%EXE_FILE%\" >nul 2>&1\n";
+    script << "if not exist \"%EXE_FILE%\" (\n";
+    script << "    echo [错误] 文件安装失败！\n";
+    script << "    echo 正在恢复备份...\n";
+    script << "    ren \"%EXE_NAME%.exe.bak\" \"%EXE_NAME%.exe\" >nul 2>&1\n";
     script << "    pause\n";
     script << "    exit /b 1\n";
     script << ")\n";
+    script << "echo      安装完成\n";
     script << "echo.\n";
 
     // 清理临时文件和备份
     script << "del /f \"%DOWNLOAD_FILE%\" >nul 2>&1\n";
-    script << "del /f \"" << exe_name << ".bak\" >nul 2>&1\n";
-    script << "echo.\n";
+    script << "del /f \"%EXE_FILE%.bak\" >nul 2>&1\n";
 
     // 启动新程序（使用相对路径）
-    script << "echo 启动新版本程序...\n";
-    script << "start \"\" \"" << exe_name << "\"\n";
+    script << "echo [4/4] 正在启动新版本程序...\n";
+    script << "start \"\" \"%EXE_FILE%\"\n";
+    script << "timeout /t 1 /nobreak >nul\n";
     script << "echo.\n";
 
     script << "echo ============================================\n";
@@ -568,10 +555,16 @@ std::string AutoUpdater::CreateUpdateScript(const std::string& download_url,
     script << "echo.\n";
     script << "timeout /t 3 /nobreak >nul\n";
 
+    // 移除隐藏属性并删除自身
+    script << "attrib -h \"%~f0\" >nul 2>&1\n";
     script << "del /f \"%~f0\" >nul 2>&1\n";
     script << "exit /b 0\n";
 
     script.close();
+
+    // 将批处理脚本设置为隐藏属性
+    SetFileAttributesA(script_path.c_str(), FILE_ATTRIBUTE_HIDDEN);
+
     return script_path;
 }
 

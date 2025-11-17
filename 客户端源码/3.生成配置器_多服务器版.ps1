@@ -84,12 +84,11 @@ if (Test-Path "DNFConfigInjector_MultiServer.exe") {
     Write-Host "  1. Run 'DNFConfigInjector_MultiServer.exe'" -ForegroundColor Gray
     Write-Host "  2. Enter API server domain (e.g., config.server.com)" -ForegroundColor Gray
     Write-Host "  3. Enter API port (default: 8080)" -ForegroundColor Gray
-    Write-Host "  4. Enter version name (e.g., 龙鸣86)" -ForegroundColor Gray
-    Write-Host "  5. Tool will generate configured client with API config embedded" -ForegroundColor Gray
+    Write-Host "  4. Tool will generate configured client with API config embedded" -ForegroundColor Gray
     Write-Host ""
 
     Write-Host "Config format embedded in exe:" -ForegroundColor Yellow
-    Write-Host '  {"config_api_url":"config.server.com","config_api_port":8080,"version_name":"龙鸣86"}' -ForegroundColor DarkGray
+    Write-Host '  {"config_api_url":"config.server.com","config_api_port":8080}' -ForegroundColor DarkGray
     Write-Host ""
 
 } else {
