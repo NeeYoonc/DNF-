@@ -73,6 +73,10 @@ static string g_tunnel_server_ip;  // 隧道服务器IP
 static bool g_auto_reload = true;  // 自动重载开关
 static pthread_t g_monitor_thread = 0;  // 配置监控线程ID
 
+// 版本更新配置
+static string g_latest_md5;  // 最新版本MD5
+static string g_download_url;  // 下载地址
+
 // 简单的JSON字符串提取函数
 string extract_json_string(const string& json, const string& key) {
     string search = "\"" + key + "\"";
@@ -108,6 +112,45 @@ int extract_json_int(const string& json, const string& key) {
     return atoi(json.c_str() + pos);
 }
 
+// 从config.json读取版本更新配置
+void load_version_config(const string& content) {
+    // 查找version字段
+    size_t version_pos = content.find("\"version\"");
+    if (version_pos == string::npos) {
+        printf("配置文件中没有version字段，跳过版本配置\n");
+        return;
+    }
+
+    // 查找version对象开始
+    size_t obj_start = content.find("{", version_pos);
+    if (obj_start == string::npos) {
+        printf("version字段格式错误\n");
+        return;
+    }
+
+    size_t obj_end = content.find("}", obj_start);
+    if (obj_end == string::npos) {
+        printf("version对象未闭合\n");
+        return;
+    }
+
+    string version_obj = content.substr(obj_start, obj_end - obj_start + 1);
+
+    // 提取md5和download_url
+    string md5 = extract_json_string(version_obj, "md5");
+    string url = extract_json_string(version_obj, "download_url");
+
+    if (!md5.empty() && !url.empty()) {
+        g_latest_md5 = md5;
+        g_download_url = url;
+        printf("版本配置加载成功:\n");
+        printf("  MD5: %s\n", g_latest_md5.c_str());
+        printf("  下载地址: %s\n", g_download_url.c_str());
+    } else {
+        printf("version字段缺少md5或download_url\n");
+    }
+}
+
 // 从config.json读取服务器配置
 bool load_server_config(const char* config_file, const char* tunnel_server_ip) {
     printf("加载配置文件: %s\n", config_file);
@@ -125,6 +168,9 @@ bool load_server_config(const char* config_file, const char* tunnel_server_ip) {
     f.close();
 
     printf("配置文件大小: %zu 字节\n", content.size());
+
+    // 加载版本更新配置
+    load_version_config(content);
 
     // 临时存储，避免在解析过程中持有锁
     vector<ServerConfig> temp_servers;
@@ -299,6 +345,16 @@ string generate_server_list_json() {
     return json.str();
 }
 
+// 生成版本信息JSON响应
+string generate_version_json() {
+    stringstream json;
+    json << "{"
+         << "\"md5\":\"" << g_latest_md5 << "\","
+         << "\"download_url\":\"" << g_download_url << "\""
+         << "}";
+    return json.str();
+}
+
 // 处理TCP请求
 void handle_tcp_request(int client_fd) {
     char buffer[1024];
@@ -320,7 +376,21 @@ void handle_tcp_request(int client_fd) {
         string json_response = generate_server_list_json();
         send(client_fd, json_response.c_str(), json_response.length(), 0);
         printf("[TCP] 已发送服务器列表 (%zu 字节)\n", json_response.length());
-    } else {
+    }
+    // 处理 GET_VERSION 请求
+    else if (strcmp(buffer, "GET_VERSION") == 0) {
+        if (g_latest_md5.empty() || g_download_url.empty()) {
+            const char* error_msg = "{\"error\":\"Version not configured\"}";
+            send(client_fd, error_msg, strlen(error_msg), 0);
+            printf("[TCP] 版本配置未设置\n");
+        } else {
+            string json_response = generate_version_json();
+            send(client_fd, json_response.c_str(), json_response.length(), 0);
+            printf("[TCP] 已发送版本信息 (%zu 字节): MD5=%s\n",
+                   json_response.length(), g_latest_md5.c_str());
+        }
+    }
+    else {
         // 未知请求
         const char* error_msg = "{\"error\":\"Unknown request\"}";
         send(client_fd, error_msg, strlen(error_msg), 0);
@@ -361,7 +431,9 @@ void* tcp_server_thread(void* arg) {
     }
 
     printf("TCP配置服务器启动在端口 %d\n", g_api_port);
-    printf("协议: 接收 'GET_SERVERS\\n', 返回JSON\n");
+    printf("支持的命令:\n");
+    printf("  - GET_SERVERS: 获取服务器列表\n");
+    printf("  - GET_VERSION: 获取版本信息(MD5 + 下载地址)\n");
 
     while (g_running) {
         struct sockaddr_in client_addr;

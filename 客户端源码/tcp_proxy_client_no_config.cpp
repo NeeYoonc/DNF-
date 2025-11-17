@@ -104,6 +104,7 @@
 #include "tcp_config_client.h"
 #include "server_selector_gui.h"
 #include "config_manager.h"
+#include "auto_updater.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -3678,6 +3679,61 @@ int main(int argc, char* argv[]) {
     }
 
     cout << "✓ 获取到 " << servers.size() << " 个服务器" << endl;
+    cout << endl;
+
+    // ========== 步骤2.5: 检查软件更新 ==========
+    cout << "[更新检查] 检查软件更新..." << endl;
+    Logger::info("[更新检查] 开始检查软件更新");
+
+    AutoUpdater updater;
+    UpdateInfo update_info;
+    wstring update_error;
+
+    // 计算当前程序的MD5
+    string current_md5;
+    if (!updater.CalculateSelfMD5(current_md5)) {
+        Logger::warning("[更新检查] 无法计算当前程序MD5");
+        cout << "  ⚠ 无法计算当前程序MD5，跳过更新检查" << endl;
+    } else {
+        Logger::info("[更新检查] 当前程序MD5: " + current_md5);
+        cout << "  当前MD5: " << current_md5.substr(0, 8) << "..." << endl;
+
+        // 从服务器获取最新版本MD5
+        if (updater.GetLatestMD5(CONFIG_API_URL, CONFIG_API_PORT, update_info, update_error)) {
+            Logger::info("[更新检查] 服务器MD5: " + update_info.latest_md5);
+            cout << "  服务器MD5: " << update_info.latest_md5.substr(0, 8) << "..." << endl;
+
+            // 检查是否需要更新（MD5对比）
+            if (updater.NeedsUpdate(current_md5, update_info.latest_md5)) {
+                Logger::info("[更新检查] MD5不匹配，发现新版本");
+                cout << "  ✓ 发现新版本！" << endl;
+
+                // 保存当前MD5到update_info
+                update_info.current_md5 = current_md5;
+
+                // 提示用户并执行更新（如果用户确认，此函数不会返回）
+                updater.PromptAndUpdate(update_info);
+
+                // 如果用户取消更新，继续执行
+                Logger::info("[更新检查] 用户取消更新，继续运行当前版本");
+                cout << "  用户取消更新，继续使用当前版本" << endl;
+            } else {
+                Logger::info("[更新检查] MD5匹配，当前已是最新版本");
+                cout << "  ✓ 当前已是最新版本" << endl;
+            }
+        } else {
+            // 转换错误消息
+            int len = WideCharToMultiByte(CP_UTF8, 0, update_error.c_str(), -1, NULL, 0, NULL, NULL);
+            char* err_str = new char[len];
+            WideCharToMultiByte(CP_UTF8, 0, update_error.c_str(), -1, err_str, len, NULL, NULL);
+
+            Logger::warning("[更新检查] 检查更新失败: " + string(err_str));
+            cout << "  ⚠ 无法检查更新: " << err_str << endl;
+            cout << "  继续使用当前版本..." << endl;
+
+            delete[] err_str;
+        }
+    }
     cout << endl;
 
     // ========== 步骤3: 选择服务器 ==========
