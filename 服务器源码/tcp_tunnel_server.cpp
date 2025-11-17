@@ -1130,6 +1130,11 @@ private:
                     Logger::info(conn_id_str() + " 已关闭游戏socket fd=" + to_string(closed_fd) +
                                "，client_to_game线程将在下次发送时检测到并停止");
 
+                    // v5.2: 设置running=false，确保连接能够被正确清理
+                    // 这是修复频道重选bug的关键：没有这行代码，handle_client()的while循环永远不会退出
+                    running = false;
+                    Logger::info(conn_id_str() + " 已设置running=false，连接将被清理");
+
                     break;  // 退出game_to_client线程
                 }
 
@@ -1691,16 +1696,37 @@ private:
                 return;
             }
 
-            // 等待连接结束
+            // 等待连接结束（带超时保护）
+            const int MAX_WAIT_SECONDS = 300;  // 最大等待5分钟
+            int wait_count = 0;
+
             while (conn->is_running()) {
                 this_thread::sleep_for(chrono::seconds(1));
+                wait_count++;
+
+                // 超时保护：防止僵尸连接
+                if (wait_count >= MAX_WAIT_SECONDS) {
+                    Logger::warning("[连接" + to_string(conn_id) + "|" + session_uuid +
+                                  "] 等待连接结束超时(" + to_string(MAX_WAIT_SECONDS) + "秒)，强制关闭");
+                    conn->stop();  // 强制停止
+                    break;
+                }
+
+                // 每60秒输出一次等待状态
+                if (wait_count % 60 == 0) {
+                    Logger::debug("[连接" + to_string(conn_id) + "|" + session_uuid +
+                                "] 等待连接结束中... (" + to_string(wait_count) + "秒)");
+                }
             }
+
+            Logger::info("[连接" + to_string(conn_id) + "|" + session_uuid + "] 连接已结束，开始清理资源");
 
             // 清理 - 关键修复: 在mutex保护下擦除，智能指针自动管理内存
             {
                 lock_guard<mutex> lock(conn_mutex);
                 connections.erase(conn_key);
             }
+            Logger::info("[连接" + to_string(conn_id) + "|" + session_uuid + "] 连接已从映射中移除，资源已释放");
             // 智能指针自动释放，无需delete - 修复了原来第992行的race condition!
 
         } catch (exception& e) {

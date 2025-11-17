@@ -1893,6 +1893,28 @@ public:
         update_client_ack(ack);
 
         if (len > 0) {
+            // v12.3.13: 检测TCP重传 - 如果seq不等于期望的server_ack，可能是重传
+            uint32_t expected_seq;
+            {
+                lock_guard<mutex> lock(seq_lock);
+                expected_seq = server_ack;
+            }
+
+            if (seq < expected_seq) {
+                // 旧数据或重传，忽略但发送ACK确认
+                Logger::warning("[连接" + to_string(conn_id) + "|端口" + to_string(dst_port) +
+                              "] ⚠ 检测到重传包! seq=" + to_string(seq) +
+                              " < expected=" + to_string(expected_seq) + " (忽略 " + to_string(len) + "字节)");
+                send_ack();  // 发送ACK告诉客户端我们已经收到了
+                return;
+            } else if (seq > expected_seq) {
+                // 乱序包，记录警告但仍然处理（可能是丢包后重传场景）
+                Logger::warning("[连接" + to_string(conn_id) + "|端口" + to_string(dst_port) +
+                              "] ⚠ 检测到乱序包! seq=" + to_string(seq) +
+                              " > expected=" + to_string(expected_seq) + " (差距=" +
+                              to_string(seq - expected_seq) + "字节)");
+            }
+
             // 打印完整载荷（16字节一行，格式化显示）
             string hex_dump = "";
             for (int i = 0; i < len; i++) {
