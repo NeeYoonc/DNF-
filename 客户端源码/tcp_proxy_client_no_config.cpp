@@ -880,7 +880,7 @@ private:
 // 静态成员初始化
 ofstream Logger::log_file;
 bool Logger::file_enabled = false;
-string Logger::current_log_level = "DEBUG";  // v12.3.7: 默认INFO级别，避免性能开销
+string Logger::current_log_level = "INFO";  // v12.3.15: 默认INFO级别，避免hex_dump性能开销
 
 // ==================== 会话UUID ====================
 // 全局会话UUID，用于在服务器日志中唯一标识此客户端
@@ -1389,6 +1389,33 @@ bool check_ip_configured(const string& adapter_name, const char* ip) {
     return found;
 }
 
+// 使用CREATE_NO_WINDOW执行命令（避免控制台闪烁）
+static int execute_command_silent(const string& command) {
+    STARTUPINFOA si = { sizeof(si) };
+    PROCESS_INFORMATION pi;
+
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    string cmd = "cmd.exe /c " + command;
+
+    if (!CreateProcessA(NULL, (LPSTR)cmd.c_str(), NULL, NULL, FALSE,
+                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        return -1;  // 失败
+    }
+
+    // 等待进程完成
+    WaitForSingleObject(pi.hProcess, 30000);  // 30秒超时
+
+    DWORD exit_code = 0;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    return exit_code;
+}
+
 // 配置IP地址（主IP + 辅助IP）
 bool configure_loopback_ips(const string& adapter_name, const string& primary_ip, const string& secondary_ip) {
     try {
@@ -1431,7 +1458,7 @@ bool configure_loopback_ips(const string& adapter_name, const string& primary_ip
                 Sleep(3000);  // 等待网卡初始化
             }
 
-            int result = system(ps_command.c_str());
+            int result = execute_command_silent(ps_command);
             Logger::debug("[IP配置] PowerShell命令执行结果: " + to_string(result));
 
             if (result == 0) {
@@ -1449,13 +1476,13 @@ bool configure_loopback_ips(const string& adapter_name, const string& primary_ip
             Logger::debug("  使用netsh配置主IP...");
             string cmd1 = "netsh interface ip set address \"" + adapter_name + "\" static " +
                          primary_ip + " " + string(LOOPBACK_ADAPTER_SUBNET);
-            system(cmd1.c_str());
+            execute_command_silent(cmd1);
             Sleep(2000);
 
             cout << "  使用netsh添加辅助IP..." << endl;
             string cmd2 = "netsh interface ip add address \"" + adapter_name + "\" " +
                          secondary_ip + " " + string(LOOPBACK_ADAPTER_SUBNET);
-            system(cmd2.c_str());
+            execute_command_silent(cmd2);
             Sleep(2000);
         }
     }

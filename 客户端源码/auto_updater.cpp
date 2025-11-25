@@ -575,7 +575,7 @@ bool AutoUpdater::LaunchUpdateScript(const std::string& script_path) {
     std::string cmd = "cmd.exe /c \"" + script_path + "\"";
 
     if (!CreateProcessA(NULL, (LPSTR)cmd.c_str(), NULL, NULL, FALSE,
-                        CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi)) {
+                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         return false;
     }
 

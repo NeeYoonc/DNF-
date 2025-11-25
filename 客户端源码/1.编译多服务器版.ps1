@@ -63,7 +63,7 @@ Write-Host "  - Resources: app.res" -ForegroundColor Gray
 Write-Host ""
 
 $compileCommand = @"
-"$vsPath" >nul 2>&1 && cl /EHsc /O2 /std:c++14 /utf-8 /W3 /D_UNICODE /DUNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX /Fe"DNF_Proxy_Client_MultiServer_v12.4.0.exe" tcp_proxy_client_no_config.cpp tcp_config_client.cpp server_selector_gui.cpp config_manager.cpp auto_updater.cpp app.res /link ws2_32.lib advapi32.lib iphlpapi.lib setupapi.lib newdev.lib cfgmgr32.lib shell32.lib comctl32.lib user32.lib gdi32.lib gdiplus.lib ole32.lib WinDivert.lib 2>&1
+"$vsPath" >nul 2>&1 && cl /EHsc /O2 /std:c++14 /utf-8 /W3 /D_UNICODE /DUNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX /Fe"DNF_Proxy_Client_MultiServer_v12.4.0.exe" tcp_proxy_client_no_config.cpp tcp_config_client.cpp server_selector_gui.cpp config_manager.cpp auto_updater.cpp app.res /link /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup ws2_32.lib advapi32.lib iphlpapi.lib setupapi.lib newdev.lib cfgmgr32.lib shell32.lib comctl32.lib user32.lib gdi32.lib gdiplus.lib ole32.lib WinDivert.lib 2>&1
 "@
 
 $output = cmd /c $compileCommand

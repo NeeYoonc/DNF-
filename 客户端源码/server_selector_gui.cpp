@@ -9,12 +9,43 @@
 #include <thread>
 #include <objidl.h>  // IStream
 #include <gdiplus.h>
+#include <tlhelp32.h>  // 用于进程枚举
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "ole32.lib")
 
 using namespace Gdiplus;
+
+// 使用Windows API结束同名进程（避免创建控制台窗口）
+static void TerminateOtherInstances(const char* exe_name, DWORD current_pid) {
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    // 转换exe_name为宽字符（因为PROCESSENTRY32使用Unicode）
+    WCHAR exe_name_w[MAX_PATH];
+    MultiByteToWideChar(CP_ACP, 0, exe_name, -1, exe_name_w, MAX_PATH);
+
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+
+    if (Process32First(snapshot, &pe32)) {
+        do {
+            // 检查进程名是否匹配且不是当前进程
+            if (_wcsicmp(pe32.szExeFile, exe_name_w) == 0 && pe32.th32ProcessID != current_pid) {
+                HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
+                if (hProcess != NULL) {
+                    TerminateProcess(hProcess, 0);
+                    CloseHandle(hProcess);
+                }
+            }
+        } while (Process32Next(snapshot, &pe32));
+    }
+
+    CloseHandle(snapshot);
+}
 
 ServerSelectorGUI::ServerSelectorGUI()
     : hwnd(NULL), hInstance(GetModuleHandle(NULL)),
@@ -376,9 +407,7 @@ void ServerSelectorGUI::OnCancelClick() {
 
     // 强制终止所有同名进程（除了当前进程）
     DWORD current_pid = GetCurrentProcessId();
-    char cmd[512];
-    sprintf(cmd, "taskkill /F /FI \"IMAGENAME eq %s\" /FI \"PID ne %lu\" >nul 2>&1", exe_name, current_pid);
-    system(cmd);
+    TerminateOtherInstances(exe_name, current_pid);
 
     // 等待一下确保子进程被终止
     Sleep(300);

@@ -61,6 +61,33 @@ private:
     string adapter_guid;  // TAP设备GUID
     bool just_installed;  // 标记网卡是否刚安装
 
+    // 使用CREATE_NO_WINDOW执行命令（避免控制台闪烁）
+    static int execute_command_silent(const string& command) {
+        STARTUPINFOA si = { sizeof(si) };
+        PROCESS_INFORMATION pi;
+
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+
+        string cmd = "cmd.exe /c " + command;
+
+        if (!CreateProcessA(NULL, (LPSTR)cmd.c_str(), NULL, NULL, FALSE,
+                            CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+            return -1;  // 失败
+        }
+
+        // 等待进程完成
+        WaitForSingleObject(pi.hProcess, 30000);  // 30秒超时
+
+        DWORD exit_code = 0;
+        GetExitCodeProcess(pi.hProcess, &exit_code);
+
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+
+        return exit_code;
+    }
+
 public:
     TAPAdapter() : adapter_ifidx(0), tap_handle(INVALID_HANDLE_VALUE), just_installed(false) {
         // 获取临时目录
@@ -262,7 +289,7 @@ private:
         // 步骤1: 添加驱动到驱动存储区
         cout << "  [1/2] 添加驱动到系统..." << endl;
         string cmd1 = "pnputil /add-driver \"" + temp_dir + "OemVista.inf\" /install >nul 2>&1";
-        int ret1 = system(cmd1.c_str());
+        int ret1 = execute_command_silent(cmd1);
 
         if (ret1 != 0) {
             cerr << "  驱动添加失败，错误码: " << ret1 << endl;
@@ -360,7 +387,7 @@ private:
         // 使用netsh查询网卡状态，输出到临时文件
         string temp_file = temp_dir + "adapter_status.txt";
         string cmd = "netsh interface show interface name=\"" + adapter_name_gbk + "\" > \"" + temp_file + "\" 2>&1";
-        system(cmd.c_str());
+        execute_command_silent(cmd);
 
         // 读取输出
         ifstream file(temp_file);
@@ -394,7 +421,7 @@ private:
         if (!just_installed && is_adapter_disabled()) {
             cout << "  检测到网卡被禁用，正在启用..." << endl;
             string cmd_enable = "netsh interface set interface name=\"" + adapter_name_gbk + "\" enable >nul 2>&1";
-            system(cmd_enable.c_str());
+            execute_command_silent(cmd_enable);
             Sleep(2000);  // 等待网卡启用
             cout << "  ✓ 网卡已启用" << endl;
         }
@@ -403,13 +430,13 @@ private:
         // 方案1: 先尝试设置静态IP（如果已有配置）
         string cmd_set = "netsh interface ip set address " + to_string(adapter_ifidx) +
                         " static " + primary_ip + " 255.255.255.0 >nul 2>&1";
-        int ret1 = system(cmd_set.c_str());
+        int ret1 = execute_command_silent(cmd_set);
 
         // 方案2: 如果设置失败，尝试添加新IP
         if (ret1 != 0) {
             string cmd_add = "netsh interface ip add address " + to_string(adapter_ifidx) +
                            " " + primary_ip + " 255.255.255.0 >nul 2>&1";
-            ret1 = system(cmd_add.c_str());
+            ret1 = execute_command_silent(cmd_add);
 
             if (ret1 != 0) {
                 cerr << "  ✗ 主IP配置失败" << endl;
@@ -424,7 +451,7 @@ private:
         string cmd_add2 = "netsh interface ip add address " + to_string(adapter_ifidx) +
                          " " + secondary_ip + " 255.255.255.0 >nul 2>&1";
 
-        int ret2 = system(cmd_add2.c_str());
+        int ret2 = execute_command_silent(cmd_add2);
         if (ret2 != 0) {
             cerr << "  ✗ 辅助IP配置失败" << endl;
             // 辅助IP失败不致命，继续
