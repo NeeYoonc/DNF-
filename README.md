@@ -41,6 +41,7 @@
 ├── README.md                              # 本文档
 ├── 服务器源码/                             # 服务器端代码
 │   ├── tcp_tunnel_server.cpp              # 服务器主程序
+│   ├── websocket_bridge.cpp               # WebSocket桥接（实验性）
 │   ├── config.json                        # 服务器配置文件
 │   ├── build.sh                           # 编译脚本
 │   └── Makefile                           # Makefile构建文件
@@ -71,6 +72,13 @@ chmod +x build.sh
 或使用Makefile:
 ```bash
 make
+```
+
+（可选）编译 WebSocket 桥接：
+```bash
+make ws-bridge       # 仅构建桥接
+# 或
+make ws-static       # 尝试静态链接
 ```
 
 #### 2. 配置服务器
@@ -110,6 +118,12 @@ make
 nohup ./dnf-tunnel-server > /dev/null 2>&1 &
 ```
 
+（可选）启动 WebSocket 桥接：
+```bash
+./dnf-tunnel-ws-bridge           # 默认监听 33280
+./dnf-tunnel-ws-bridge 18080     # 指定监听端口
+```
+
 #### 4. 查看日志
 ```bash
 tail -f log/server_log_*.txt
@@ -122,7 +136,7 @@ tail -f log/server_log_*.txt
 **步骤1**: 编译空白客户端
 ```powershell
 cd 带配置的客户端源码/
-.\1.编译空白客户端.ps1
+.\u00301.编译空白客户端.ps1
 ```
 生成 `tcp_proxy_client_blank.exe`
 
@@ -134,22 +148,22 @@ python 2.生成客户端2进制编码.py
 
 **步骤3**: 编译配置注入工具
 ```powershell
-.\3.生成配置器.ps1
+.3.生成配置器.ps1
 ```
 生成 `config_injector.exe`
 
 **步骤4**: 注入配置生成最终客户端
 ```powershell
-# 语法：config_injector.exe <空白客户端> <游戏服务器IP> <隧道服务器IP> <隧道端口> <输出文件>
+# 语法：config_injector.exe 空白客户端 游戏服务器IP 隧道服务器IP 隧道端口 输出文件
 
 # IPv4示例
-.\config_injector.exe tcp_proxy_client_blank.exe 192.168.1.100 10.0.0.50 33223 "DNF代理客户端-服务器1.exe"
+.config_injector.exe tcp_proxy_client_blank.exe 192.168.1.100 10.0.0.50 33223 "DNF代理客户端-服务器1.exe"
 
 # IPv6示例 🆕
-.\config_injector.exe tcp_proxy_client_blank.exe 2001:db8::100 2001:db8::50 33224 "DNF代理客户端-IPv6.exe"
+.config_injector.exe tcp_proxy_client_blank.exe 2001:db8::100 2001:db8::50 33224 "DNF代理客户端-IPv6.exe"
 
 # 域名示例 🆕
-.\config_injector.exe tcp_proxy_client_blank.exe game.local tunnel.example.com 33225 "DNF代理客户端-域名.exe"
+.config_injector.exe tcp_proxy_client_blank.exe game.local tunnel.example.com 33225 "DNF代理客户端-域名.exe"
 ```
 
 #### 方式二：直接修改源码编译
@@ -498,7 +512,6 @@ grep "FIN\|半关闭\|断开" log/server_log_*.txt
 - 🔧 改进：服务器监听使用 `sockaddr_in6` 双栈模式
 - 📝 文档：添加IPv6和域名配置示例
 - ⚡ 性能：DNS解析支持多地址自动轮询
-- ✅ 兼容：完全向后兼容现有IPv4配置
 
 ### v3.3 (2025-10-14)
 - ✨ 新增：多服务器端口复用架构
@@ -575,3 +588,54 @@ string filter = is_ipv6
     ? "ipv6.DstAddr == " + game_server_ip  // IPv6过滤器
     : "ip.DstAddr == " + game_server_ip;    // IPv4过滤器
 ```
+
+## 🧪 WebSocket 桥接（实验性）
+
+为适配 HTTP(S)/反向代理/统一 80/443 端口，项目提供一个独立的 WebSocket 桥接进程，将 WebSocket(Binary) 流量桥接到本机 dnf-tunnel-server 的原生端口。
+
+- 进程：dnf-tunnel-ws-bridge（独立二进制）
+- 默认监听：33280（IPv4/IPv6 双栈）
+- 路径映射：/dnf/<port> → 127.0.0.1:<port>（未指定端口默认 33223）
+- 子协议：dnf-tunnel-v1（可选）
+
+编译：
+```
+cd 服务器源码/
+make ws-bridge        # 常规动态编译
+# 或
+make ws-static        # 尝试静态链接（系统需支持）
+```
+
+运行：
+```
+./dnf-tunnel-ws-bridge            # 监听 33280
+# 或指定端口
+./dnf-tunnel-ws-bridge 18080
+```
+
+Nginx 反代示例：
+```
+upstream dnf_tunnel_ws { server 127.0.0.1:33280; }
+server {
+  listen 443 ssl http2;
+  server_name tunnel.example.com;
+  ssl_certificate     /path/fullchain.pem;
+  ssl_certificate_key /path/privkey.pem;
+
+  location /dnf {
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "Upgrade";
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    proxy_pass http://dnf_tunnel_ws;
+  }
+}
+```
+
+注意：
+- 桥接层不改变现有二进制协议；客户端需以 WebSocket Binary 帧承载原消息。
+- 首期为“每连接一条 WS 连接”的兼容模式；后续可在 WS 内复用多个 conn_id。
+- TLS 由反向代理负责（推荐 WSS 443）。
