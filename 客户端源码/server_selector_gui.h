@@ -7,6 +7,9 @@
 #define SERVER_SELECTOR_GUI_H
 
 #include <windows.h>
+#include <atomic>
+#include <mutex>
+#include <thread>
 #include <vector>
 #include <string>
 #include "tcp_config_client.h"
@@ -21,6 +24,8 @@
 #define IDC_BTN_SHOW_LOG   1006  // "查看日志" 按钮
 #define IDC_EDIT_LOG       1007  // 日志文本框
 #define IDC_BTN_BACK       1008  // "返回" 按钮
+#define IDC_STATIC_LATENCY_LABEL 1009  // "延迟:" 标签
+#define IDC_STATIC_LATENCY_VALUE 1010  // 延迟数值
 
 // 服务器选择器类
 class ServerSelectorGUI {
@@ -68,6 +73,12 @@ private:
     HBITMAP hBackgroundBitmap;  // 背景位图句柄
     int bg_width;  // 背景图片宽度
     int bg_height;  // 背景图片高度
+    std::thread latency_probe_thread;
+    std::atomic<bool> latency_probe_running;
+    std::mutex latency_target_mutex;
+    std::string latency_target_host;
+    int latency_target_port;
+    bool latency_target_valid;
 
     // 窗口过程函数
     static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -83,6 +94,10 @@ private:
     bool StartChildProcess(const ServerInfo& server);  // 启动子进程
     void StopChildProcess();  // 停止子进程
     void ReadChildOutput();  // 读取子进程输出
+    void StartLatencyProbe();
+    void StopLatencyProbe();
+    void RefreshLatencyDisplay();
+    void ApplyLatencyText(int latency_ms);
 
     // 填充服务器列表
     void PopulateServerList(int last_server_id);
