@@ -10,16 +10,51 @@
 #include <objidl.h>  // IStream
 #include <gdiplus.h>
 #include <tlhelp32.h>  // 用于进程枚举
+#include <uxtheme.h>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "uxtheme.lib")
 
 using namespace Gdiplus;
 
 namespace {
 constexpr UINT kMsgLatencyUpdate = WM_APP + 100;
 constexpr int kLatencyConnectTimeoutMs = 800;
+constexpr UINT_PTR kLatencyWatchdogTimerId = 0x4C41;
+constexpr UINT kLatencyWatchdogIntervalMs = 120;
+constexpr ULONGLONG kLatencyRttStaleMs = 2500;
+constexpr double kLatencyEmaAlpha = 0.35;
+
+ULONGLONG g_last_real_rtt_tick = 0;
+double g_smoothed_real_rtt_ms = -1.0;
+
+void ResetRealLatencyState() {
+    g_last_real_rtt_tick = 0;
+    g_smoothed_real_rtt_ms = -1.0;
+}
+
+int SmoothRealLatencyForUi(int raw_ms) {
+    if (raw_ms < 0) {
+        return -1;
+    }
+
+    if (g_smoothed_real_rtt_ms < 0.0) {
+        g_smoothed_real_rtt_ms = static_cast<double>(raw_ms);
+    } else {
+        g_smoothed_real_rtt_ms =
+            g_smoothed_real_rtt_ms * (1.0 - kLatencyEmaAlpha) +
+            static_cast<double>(raw_ms) * kLatencyEmaAlpha;
+    }
+
+    if (g_smoothed_real_rtt_ms > 9999.0) {
+        g_smoothed_real_rtt_ms = 9999.0;
+    }
+
+    g_last_real_rtt_tick = GetTickCount64();
+    return static_cast<int>(g_smoothed_real_rtt_ms + 0.5);
+}
 
 int MeasureTcpLatencyMs(const std::string& host, int port, int timeout_ms) {
     if (host.empty() || port <= 0 || port > 65535) {
@@ -128,9 +163,13 @@ ServerSelectorGUI::ServerSelectorGUI()
       child_job_object(NULL), hBackgroundBitmap(NULL), bg_width(0), bg_height(0),
       latency_probe_running(false), latency_target_port(0), latency_target_valid(false) {
     ZeroMemory(&child_process, sizeof(child_process));
+    ResetRealLatencyState();
 }
 
 ServerSelectorGUI::~ServerSelectorGUI() {
+    if (hwnd) {
+        KillTimer(hwnd, kLatencyWatchdogTimerId);
+    }
     StopLatencyProbe();
     // 停止子进程
     StopChildProcess();
@@ -314,7 +353,8 @@ bool ServerSelectorGUI::InitWindow() {
     );
     SendMessage(hBtnCancel, WM_SETFONT, (WPARAM)hButtonFont, TRUE);
 
-    HWND hLatencyLabel = CreateWindowW(
+    HWND hLatencyLabel = CreateWindowExW(
+        WS_EX_TRANSPARENT,
         L"STATIC", L"\u5EF6\u8FDF:",
         WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_CENTERIMAGE,
         470, 25, 70, 40,
@@ -322,8 +362,8 @@ bool ServerSelectorGUI::InitWindow() {
     );
 
     HWND hLatencyValue = CreateWindowW(
-        L"STATIC", L"--",
-        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
+        L"STATIC", L"--ms",
+        WS_CHILD | WS_VISIBLE | SS_OWNERDRAW,
         545, 25, 95, 40,
         hwnd, (HMENU)IDC_STATIC_LATENCY_VALUE, hInstance, NULL
     );
@@ -545,9 +585,9 @@ void ServerSelectorGUI::ApplyLatencyText(int latency_ms) {
 
     wchar_t text[64];
     if (latency_ms >= 0) {
-        swprintf_s(text, L"%4dms", latency_ms);
+        swprintf_s(text, L"%dms", latency_ms);
     } else {
-        wcscpy_s(text, L"  --ms");
+        wcscpy_s(text, L"--ms");
     }
 
     wchar_t current[64] = {};
@@ -557,6 +597,7 @@ void ServerSelectorGUI::ApplyLatencyText(int latency_ms) {
     }
 
     SetWindowTextW(hLatencyValue, text);
+    InvalidateRect(hLatencyValue, NULL, FALSE);
 }
 
 void ServerSelectorGUI::RefreshLatencyDisplay() {
@@ -609,6 +650,9 @@ void ServerSelectorGUI::OnConnectClick() {
     if (StartChildProcess(servers[selected_index])) {
         user_confirmed = true;
         is_connected = true;  // 标记为已连接
+        StopLatencyProbe();   // 连接后切换为子进程心跳RTT，不再使用connect探测
+        ResetRealLatencyState();
+        SetTimer(hwnd, kLatencyWatchdogTimerId, kLatencyWatchdogIntervalMs, NULL);
         AppendLog(L"✓ 隧道进程已启动\r\n\r\n");
     } else {
         AppendLog(L"✗ 启动隧道进程失败\r\n\r\n");
@@ -620,6 +664,10 @@ void ServerSelectorGUI::OnCancelClick() {
     // 停止子进程
     StopChildProcess();
     StopLatencyProbe();
+    if (hwnd) {
+        KillTimer(hwnd, kLatencyWatchdogTimerId);
+    }
+    ResetRealLatencyState();
 
     // 获取当前进程名（不包含路径）
     char exe_path[MAX_PATH];
@@ -686,6 +734,10 @@ void ServerSelectorGUI::ShowLogPage() {
 
 void ServerSelectorGUI::ShowServerPage() {
     showing_log = false;
+    if (hwnd) {
+        KillTimer(hwnd, kLatencyWatchdogTimerId);
+    }
+    ResetRealLatencyState();
 
     // 显示服务器选择页面的控件
     for (HWND btn : server_buttons) {
@@ -698,6 +750,9 @@ void ServerSelectorGUI::ShowServerPage() {
     ShowWindow(GetDlgItem(hwnd, IDC_BTN_SHOW_LOG), SW_SHOW);
     ShowWindow(GetDlgItem(hwnd, IDC_STATIC_LATENCY_LABEL), SW_SHOW);
     ShowWindow(GetDlgItem(hwnd, IDC_STATIC_LATENCY_VALUE), SW_SHOW);
+    if (!latency_probe_running.load(std::memory_order_acquire)) {
+        StartLatencyProbe();
+    }
     RefreshLatencyDisplay();
 
     // 隐藏日志页面的控件
@@ -1030,7 +1085,7 @@ LRESULT CALLBACK ServerSelectorGUI::WindowProc(HWND hwnd, UINT msg, WPARAM wPara
             int ctrlID = GetDlgCtrlID(hControl);
 
             // 只对标题文本和下载地址标签设置透明背景
-            if (ctrlID == IDC_STATIC_LABEL || ctrlID == IDC_STATIC_LATENCY_LABEL || ctrlID == IDC_STATIC_LATENCY_VALUE || ctrlID == 0) {
+            if (ctrlID == IDC_STATIC_LABEL || ctrlID == IDC_STATIC_LATENCY_LABEL || ctrlID == 0) {
                 HDC hdcStatic = (HDC)wParam;
                 SetBkMode(hdcStatic, TRANSPARENT);
                 return (LRESULT)GetStockObject(NULL_BRUSH);
@@ -1041,6 +1096,31 @@ LRESULT CALLBACK ServerSelectorGUI::WindowProc(HWND hwnd, UINT msg, WPARAM wPara
         case WM_DRAWITEM: {
             // 自定义绘制ListBox项（现代扁平风格）
             LPDRAWITEMSTRUCT lpDIS = (LPDRAWITEMSTRUCT)lParam;
+            if (lpDIS->CtlID == IDC_STATIC_LATENCY_VALUE) {
+                HDC hDC = lpDIS->hDC;
+                RECT rcLocal{};
+                GetClientRect(lpDIS->hwndItem, &rcLocal);
+
+                // 由系统绘制父窗口背景，避免手动采样背景导致的“半透明/发虚”感
+                if (FAILED(DrawThemeParentBackground(lpDIS->hwndItem, hDC, &rcLocal))) {
+                    HBRUSH hBrush = CreateSolidBrush(RGB(245, 247, 250));
+                    FillRect(hDC, &rcLocal, hBrush);
+                    DeleteObject(hBrush);
+                }
+
+                wchar_t text[64] = {};
+                GetWindowTextW(lpDIS->hwndItem, text, _countof(text));
+
+                SetBkMode(hDC, TRANSPARENT);
+                SetTextColor(hDC, RGB(20, 20, 20));
+                HFONT hFont = (HFONT)SendMessageW(lpDIS->hwndItem, WM_GETFONT, 0, 0);
+                HFONT hOldFont = (HFONT)SelectObject(hDC, hFont);
+                DrawTextW(hDC, text, -1, &rcLocal, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                SelectObject(hDC, hOldFont);
+
+                return TRUE;
+            }
+
             if (lpDIS->CtlID == IDC_SERVER_LIST) {
                 // 获取设备上下文
                 HDC hDC = lpDIS->hDC;
@@ -1165,13 +1245,77 @@ LRESULT CALLBACK ServerSelectorGUI::WindowProc(HWND hwnd, UINT msg, WPARAM wPara
             break;
 
         case kMsgLatencyUpdate:
-            pThis->ApplyLatencyText(static_cast<int>(lParam));
+            if (!pThis->is_connected) {
+                pThis->ApplyLatencyText(static_cast<int>(lParam));
+            }
             return 0;
+
+        case WM_TIMER:
+            if (wParam == kLatencyWatchdogTimerId) {
+                if (!pThis->is_connected) {
+                    KillTimer(hwnd, kLatencyWatchdogTimerId);
+                    return 0;
+                }
+
+                ULONGLONG now = GetTickCount64();
+                // 首个真实RTT到来前保留当前显示值；只有拿到过RTT后才做超时回退
+                if (g_last_real_rtt_tick != 0 &&
+                    (now - g_last_real_rtt_tick) > kLatencyRttStaleMs) {
+                    pThis->ApplyLatencyText(-1);
+                }
+                return 0;
+            }
+            break;
 
         case WM_USER + 1:
             // 接收从子进程读取线程发送的日志消息
             if (pThis && lParam) {
                 std::wstring* msg = (std::wstring*)lParam;
+
+                // 解析子进程输出中的真实RTT标记: [LATENCY_RTT] 23
+                static std::wstring s_pending_log;
+                s_pending_log += *msg;
+
+                size_t line_start = 0;
+                while (true) {
+                    size_t line_end = s_pending_log.find(L'\n', line_start);
+                    if (line_end == std::wstring::npos) {
+                        if (line_start > 0) {
+                            s_pending_log.erase(0, line_start);
+                        }
+                        // 防止极端情况下缓存无限增长
+                        const size_t kMaxPending = 4096;
+                        if (s_pending_log.size() > kMaxPending) {
+                            s_pending_log.erase(0, s_pending_log.size() - kMaxPending);
+                        }
+                        break;
+                    }
+
+                    std::wstring line = s_pending_log.substr(line_start, line_end - line_start);
+                    const std::wstring marker = L"[LATENCY_RTT]";
+                    size_t marker_pos = line.find(marker);
+                    if (marker_pos != std::wstring::npos) {
+                        size_t pos = marker_pos + marker.length();
+                        while (pos < line.size() && (line[pos] < L'0' || line[pos] > L'9')) {
+                            ++pos;
+                        }
+
+                        int rtt_ms = 0;
+                        bool has_digits = false;
+                        while (pos < line.size() && line[pos] >= L'0' && line[pos] <= L'9') {
+                            has_digits = true;
+                            rtt_ms = rtt_ms * 10 + (line[pos] - L'0');
+                            ++pos;
+                        }
+
+                        if (has_digits && pThis->is_connected) {
+                            pThis->ApplyLatencyText(SmoothRealLatencyForUi(rtt_ms));
+                        }
+                    }
+
+                    line_start = line_end + 1;
+                }
+
                 pThis->AppendLog(*msg);
                 delete msg;
             }

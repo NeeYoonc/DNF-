@@ -1784,7 +1784,11 @@ private:
 
     // v12.3.9: 心跳保活机制
     DWORD last_heartbeat_time;
-    const int HEARTBEAT_INTERVAL_MS = 20000;  // 20秒心跳间隔
+    DWORD last_heartbeat_send_time;
+    bool heartbeat_waiting_reply;
+    const int HEARTBEAT_MIN_INTERVAL_MS = 220;      // 连续RTT采样最小间隔
+    const int HEARTBEAT_REPLY_TIMEOUT_MS = 1500;    // 超时后允许重发心跳
+    const int HEARTBEAT_LOG_MIN_INTERVAL_MS = 250;  // RTT日志最小间隔，避免刷屏
 public:
     TCPConnection(int id, const string& sip, uint16_t sport,
                   const string& dip, uint16_t dport,
@@ -1800,7 +1804,7 @@ public:
           client_acked_seq(0),
           tunnel_sock(INVALID_SOCKET), running(false), established(false), closing(false),
           last_window_probe_time(0), window_zero_start_time(0), window_probe_logged(false),
-          last_heartbeat_time(0) {
+          last_heartbeat_time(0), last_heartbeat_send_time(0), heartbeat_waiting_reply(false) {
 
         // v12.3.12: 窗口策略完整修复
         // advertised_window: 65535 - SYN-ACK握手时通告给游戏客户端的接收窗口
@@ -2246,7 +2250,13 @@ private:
         while (running) {
             // v12.3.9: 定期发送心跳包(20秒间隔)
             DWORD current_time = GetTickCount();
-            if (current_time - last_heartbeat_time >= HEARTBEAT_INTERVAL_MS) {
+            if (heartbeat_waiting_reply &&
+                current_time - last_heartbeat_send_time >= (DWORD)HEARTBEAT_REPLY_TIMEOUT_MS) {
+                heartbeat_waiting_reply = false;
+            }
+
+            if (!heartbeat_waiting_reply &&
+                current_time - last_heartbeat_time >= (DWORD)HEARTBEAT_MIN_INTERVAL_MS) {
                 // 心跳包: msg_type(0x02) + conn_id(4) + data_len(2) = 7字节
                 uint8_t heartbeat[7];
                 heartbeat[0] = 0x02;  // 心跳消息类型
@@ -2257,6 +2267,8 @@ private:
                     Logger::debug("[连接" + to_string(conn_id) + "|端口" + to_string(dst_port) +
                                  "] 💓 发送心跳包");
                     last_heartbeat_time = current_time;
+                    last_heartbeat_send_time = current_time;
+                    heartbeat_waiting_reply = true;
                 } else {
                     Logger::warning("[连接" + to_string(conn_id) + "] ⚠️ 心跳包发送失败");
                 }
@@ -2367,7 +2379,26 @@ private:
 
                 // v12.3.9: 处理心跳包回复
                 if (msg_type == 0x02) {
+                    heartbeat_waiting_reply = false;
                     Logger::debug("[连接" + to_string(conn_id) + "] 💓 收到心跳包回复");
+
+                    if (last_heartbeat_send_time != 0) {
+                        DWORD now_tick = GetTickCount();
+                        DWORD rtt_ms = now_tick - last_heartbeat_send_time;
+                        if (rtt_ms > 9999) {
+                            rtt_ms = 9999;
+                        }
+
+                        // 全局节流输出RTT，供GUI解析为“真实延迟”
+                        static std::atomic<DWORD> s_last_rtt_log_tick(0);
+                        DWORD last_tick = s_last_rtt_log_tick.load(std::memory_order_relaxed);
+                        if (now_tick - last_tick >= (DWORD)HEARTBEAT_LOG_MIN_INTERVAL_MS &&
+                            s_last_rtt_log_tick.compare_exchange_strong(
+                                last_tick, now_tick, std::memory_order_relaxed)) {
+                            Logger::info("[LATENCY_RTT] " + to_string((int)rtt_ms));
+                        }
+                    }
+
                     buffer.erase(buffer.begin(), buffer.begin() + 7);
                     continue;
                 }
