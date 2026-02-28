@@ -1,4 +1,7 @@
 #include "resource.h"
 
+// UAC: force elevation on launch.
+IDR_MANIFEST RT_MANIFEST "app.manifest"
+
 // 背景图片资源（自定义类型）
 IDB_BACKGROUND RCDATA "background.jpg"
