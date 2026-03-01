@@ -17,6 +17,26 @@
 
 using namespace Gdiplus;
 
+namespace {
+const int SERVER_GRID_COLS = 3;
+const int SERVER_GRID_ROWS = 4;
+const int SERVER_GRID_START_X = 30;
+const int SERVER_GRID_START_Y = 95;
+const int SERVER_BUTTON_WIDTH = 235;
+const int SERVER_BUTTON_HEIGHT = 60;
+const int SERVER_BUTTON_GAP_X = 10;
+const int SERVER_BUTTON_GAP_Y = 10;
+const int SERVER_PAGE_SIZE = SERVER_GRID_COLS * SERVER_GRID_ROWS;
+
+const int PAGE_CTRL_Y = 420;
+const int PAGE_BTN_WIDTH = 95;
+const int PAGE_INFO_WIDTH = 90;
+const int PAGE_CTRL_HEIGHT = 28;
+const int PAGE_PREV_X = 280;
+const int PAGE_INFO_X = PAGE_PREV_X + PAGE_BTN_WIDTH + 10;
+const int PAGE_NEXT_X = PAGE_INFO_X + PAGE_INFO_WIDTH + 10;
+}
+
 // 使用Windows API结束同名进程（避免创建控制台窗口）
 static void TerminateOtherInstances(const char* exe_name, DWORD current_pid) {
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -49,7 +69,9 @@ static void TerminateOtherInstances(const char* exe_name, DWORD current_pid) {
 
 ServerSelectorGUI::ServerSelectorGUI()
     : hwnd(NULL), hInstance(GetModuleHandle(NULL)),
-      selected_index(-1), user_confirmed(false), showing_log(false), is_connected(false),
+      selected_index(-1), user_confirmed(false),
+      current_page(0), total_pages(1),
+      showing_log(false), is_connected(false),
       dialog_should_close(false), child_running(false), child_stdout_read(NULL), child_stdout_write(NULL),
       child_job_object(NULL), hBackgroundBitmap(NULL), bg_width(0), bg_height(0) {
     ZeroMemory(&child_process, sizeof(child_process));
@@ -137,7 +159,7 @@ bool ServerSelectorGUI::InitWindow() {
         WS_EX_DLGMODALFRAME | WS_EX_LAYERED,  // 去掉置顶，添加分层窗口支持阴影
         L"DNFServerSelector",
         L"选择服务器",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,  // 添加最小化按钮
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,  // 添加最小化按钮
         x, y, window_width, window_height,
         NULL, NULL, hInstance, this  // 传递this指针
     );
@@ -272,6 +294,31 @@ bool ServerSelectorGUI::InitWindow() {
     );
     SendMessage(hBtnBack, WM_SETFONT, (WPARAM)hButtonFont, TRUE);
 
+    // 11. 分页控件（服务器列表）
+    HWND hBtnPrevPage = CreateWindowW(
+        L"BUTTON", L"上一页",
+        WS_CHILD | BS_PUSHBUTTON | BS_FLAT,
+        PAGE_PREV_X, PAGE_CTRL_Y, PAGE_BTN_WIDTH, PAGE_CTRL_HEIGHT,
+        hwnd, (HMENU)IDC_BTN_PREV_PAGE, hInstance, NULL
+    );
+    SendMessage(hBtnPrevPage, WM_SETFONT, (WPARAM)hSmallFont, TRUE);
+
+    HWND hPageInfo = CreateWindowW(
+        L"STATIC", L"1/1",
+        WS_CHILD | SS_CENTER | SS_CENTERIMAGE,
+        PAGE_INFO_X, PAGE_CTRL_Y, PAGE_INFO_WIDTH, PAGE_CTRL_HEIGHT,
+        hwnd, (HMENU)IDC_STATIC_PAGE_INFO, hInstance, NULL
+    );
+    SendMessage(hPageInfo, WM_SETFONT, (WPARAM)hSmallFont, TRUE);
+
+    HWND hBtnNextPage = CreateWindowW(
+        L"BUTTON", L"下一页",
+        WS_CHILD | BS_PUSHBUTTON | BS_FLAT,
+        PAGE_NEXT_X, PAGE_CTRL_Y, PAGE_BTN_WIDTH, PAGE_CTRL_HEIGHT,
+        hwnd, (HMENU)IDC_BTN_NEXT_PAGE, hInstance, NULL
+    );
+    SendMessage(hBtnNextPage, WM_SETFONT, (WPARAM)hSmallFont, TRUE);
+
     return true;
 }
 
@@ -283,6 +330,8 @@ void ServerSelectorGUI::PopulateServerList(int last_server_id) {
         }
     }
     server_buttons.clear();
+    current_page = 0;
+    total_pages = 1;
 
     // 创建按钮字体
     HFONT hButtonFont = CreateFont(
@@ -291,29 +340,14 @@ void ServerSelectorGUI::PopulateServerList(int last_server_id) {
         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"微软雅黑"
     );
 
-    // 网格布局参数
-    const int cols = 3;           // 每行3个
-    const int start_x = 30;
-    const int start_y = 95;
-    const int btn_width = 235;    // 按钮宽度
-    const int btn_height = 60;    // 按钮高度
-    const int gap_x = 10;         // 水平间距
-    const int gap_y = 10;         // 垂直间距
-
     int default_index = -1;
 
     // 创建服务器按钮
     for (size_t i = 0; i < servers.size(); i++) {
-        int row = i / cols;
-        int col = i % cols;
-
-        int x = start_x + col * (btn_width + gap_x);
-        int y = start_y + row * (btn_height + gap_y);
-
         HWND hBtn = CreateWindowW(
             L"BUTTON", servers[i].name.c_str(),
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_FLAT | BS_MULTILINE,
-            x, y, btn_width, btn_height,
+            WS_CHILD | BS_PUSHBUTTON | BS_FLAT | BS_MULTILINE,
+            0, 0, SERVER_BUTTON_WIDTH, SERVER_BUTTON_HEIGHT,
             hwnd, (HMENU)(IDC_SERVER_BTN_BASE + i), hInstance, NULL
         );
 
@@ -322,20 +356,137 @@ void ServerSelectorGUI::PopulateServerList(int last_server_id) {
 
         // 如果是上次选择的服务器，记录索引
         if (servers[i].id == last_server_id) {
-            default_index = i;
+            default_index = (int)i;
         }
     }
+
+    int server_count = (int)servers.size();
+    total_pages = (server_count > 0) ? ((server_count + SERVER_PAGE_SIZE - 1) / SERVER_PAGE_SIZE) : 1;
 
     // 如果有上次选择，自动选中并显示信息
     if (default_index >= 0) {
         selected_index = default_index;
         UpdateServerInfo(default_index);
-        // 高亮显示（可选：设置焦点）
-        if (default_index < (int)server_buttons.size()) {
-            SetFocus(server_buttons[default_index]);
+        current_page = default_index / SERVER_PAGE_SIZE;
+    } else {
+        UpdateServerInfo(-1);
+    }
+
+    UpdateServerButtonLayout();
+    UpdatePaginationControls();
+
+    // 高亮显示（可选：设置焦点）
+    if (selected_index >= 0 && selected_index < (int)server_buttons.size()) {
+        SetFocus(server_buttons[selected_index]);
+    }
+}
+
+void ServerSelectorGUI::UpdateServerButtonLayout() {
+    if (showing_log) {
+        return;
+    }
+
+    HDWP hdwp = BeginDeferWindowPos((int)server_buttons.size());
+    int page_start = current_page * SERVER_PAGE_SIZE;
+    int page_end = page_start + SERVER_PAGE_SIZE;
+
+    for (size_t i = 0; i < server_buttons.size(); ++i) {
+        HWND btn = server_buttons[i];
+        if (!btn) {
+            continue;
+        }
+
+        int idx = (int)i;
+        if (idx < page_start || idx >= page_end) {
+            ShowWindow(btn, SW_HIDE);
+            continue;
+        }
+
+        int local_index = idx - page_start;
+        int row = local_index / SERVER_GRID_COLS;
+        int col = local_index % SERVER_GRID_COLS;
+
+        int x = SERVER_GRID_START_X + col * (SERVER_BUTTON_WIDTH + SERVER_BUTTON_GAP_X);
+        int y = SERVER_GRID_START_Y + row * (SERVER_BUTTON_HEIGHT + SERVER_BUTTON_GAP_Y);
+
+        if (hdwp) {
+            hdwp = DeferWindowPos(
+                hdwp, btn, NULL, x, y, SERVER_BUTTON_WIDTH, SERVER_BUTTON_HEIGHT,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW
+            );
+        } else {
+            SetWindowPos(
+                btn, NULL, x, y, SERVER_BUTTON_WIDTH, SERVER_BUTTON_HEIGHT,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW
+            );
         }
     }
 
+    if (hdwp) {
+        EndDeferWindowPos(hdwp);
+    }
+}
+
+void ServerSelectorGUI::ConfigureServerScrollBar() {
+    // 兼容旧接口：滚动改为翻页后不再使用滚动条
+    UpdatePaginationControls();
+}
+
+void ServerSelectorGUI::ScrollServerList(int delta) {
+    // 兼容旧接口：delta>0 视为上一页，delta<0 视为下一页
+    if (delta > 0) {
+        ChangePage(-1);
+    } else if (delta < 0) {
+        ChangePage(1);
+    }
+}
+
+void ServerSelectorGUI::UpdatePaginationControls() {
+    HWND hPrev = GetDlgItem(hwnd, IDC_BTN_PREV_PAGE);
+    HWND hNext = GetDlgItem(hwnd, IDC_BTN_NEXT_PAGE);
+    HWND hInfo = GetDlgItem(hwnd, IDC_STATIC_PAGE_INFO);
+
+    if (!hPrev || !hNext || !hInfo) {
+        return;
+    }
+
+    bool show = (!showing_log && total_pages > 1);
+    ShowWindow(hPrev, show ? SW_SHOW : SW_HIDE);
+    ShowWindow(hNext, show ? SW_SHOW : SW_HIDE);
+    ShowWindow(hInfo, show ? SW_SHOW : SW_HIDE);
+
+    if (!show) {
+        return;
+    }
+
+    wchar_t page_text[32];
+    swprintf(page_text, 32, L"%d/%d", current_page + 1, total_pages);
+    SetWindowTextW(hInfo, page_text);
+    InvalidateRect(hInfo, NULL, TRUE);
+
+    EnableWindow(hPrev, current_page > 0);
+    EnableWindow(hNext, current_page < total_pages - 1);
+}
+
+void ServerSelectorGUI::ChangePage(int delta) {
+    if (total_pages <= 1 || delta == 0) {
+        return;
+    }
+
+    int new_page = current_page + delta;
+    if (new_page < 0) {
+        new_page = 0;
+    }
+    if (new_page >= total_pages) {
+        new_page = total_pages - 1;
+    }
+    if (new_page == current_page) {
+        return;
+    }
+
+    current_page = new_page;
+    UpdateServerButtonLayout();
+    UpdatePaginationControls();
 }
 
 void ServerSelectorGUI::UpdateServerInfo(int index) {
@@ -448,6 +599,9 @@ void ServerSelectorGUI::ShowLogPage() {
     ShowWindow(GetDlgItem(hwnd, IDC_BTN_CONNECT), SW_HIDE);
     ShowWindow(GetDlgItem(hwnd, IDC_BTN_CANCEL), SW_HIDE);
     ShowWindow(GetDlgItem(hwnd, IDC_BTN_SHOW_LOG), SW_HIDE);
+    ShowWindow(GetDlgItem(hwnd, IDC_BTN_PREV_PAGE), SW_HIDE);
+    ShowWindow(GetDlgItem(hwnd, IDC_STATIC_PAGE_INFO), SW_HIDE);
+    ShowWindow(GetDlgItem(hwnd, IDC_BTN_NEXT_PAGE), SW_HIDE);
 
     // 显示日志页面的控件
     ShowWindow(GetDlgItem(hwnd, IDC_EDIT_LOG), SW_SHOW);
@@ -462,9 +616,8 @@ void ServerSelectorGUI::ShowServerPage() {
     showing_log = false;
 
     // 显示服务器选择页面的控件
-    for (HWND btn : server_buttons) {
-        ShowWindow(btn, SW_SHOW);
-    }
+    UpdateServerButtonLayout();
+    UpdatePaginationControls();
     ShowWindow(GetDlgItem(hwnd, IDC_STATIC_LABEL), SW_SHOW);
     ShowWindow(GetDlgItem(hwnd, IDC_EDIT_DOWNLOAD), SW_SHOW);
     ShowWindow(GetDlgItem(hwnd, IDC_BTN_CONNECT), SW_SHOW);
@@ -896,6 +1049,12 @@ LRESULT CALLBACK ServerSelectorGUI::WindowProc(HWND hwnd, UINT msg, WPARAM wPara
                     // 切换到日志页面
                     pThis->ShowLogPage();
                     return 0;
+                } else if (ctrl_id == IDC_BTN_PREV_PAGE) {
+                    pThis->ChangePage(-1);
+                    return 0;
+                } else if (ctrl_id == IDC_BTN_NEXT_PAGE) {
+                    pThis->ChangePage(1);
+                    return 0;
                 } else if (ctrl_id == IDC_BTN_BACK) {
                     // 返回服务器选择页面
                     if (pThis->is_connected) {
@@ -919,7 +1078,7 @@ LRESULT CALLBACK ServerSelectorGUI::WindowProc(HWND hwnd, UINT msg, WPARAM wPara
                         pThis->ShowServerPage();
                     }
                     return 0;
-                } else if (ctrl_id >= IDC_SERVER_BTN_BASE && ctrl_id < IDC_SERVER_BTN_BASE + 100) {
+                } else if (ctrl_id >= IDC_SERVER_BTN_BASE && ctrl_id < IDC_SERVER_BTN_BASE + 1000) {
                     // 服务器按钮点击
                     int server_index = ctrl_id - IDC_SERVER_BTN_BASE;
                     pThis->OnServerButtonClick(server_index);
@@ -931,6 +1090,18 @@ LRESULT CALLBACK ServerSelectorGUI::WindowProc(HWND hwnd, UINT msg, WPARAM wPara
             } else if (HIWORD(wParam) == LBN_DBLCLK) {
                 // 双击直接连接
                 pThis->OnConnectClick();
+                return 0;
+            }
+            break;
+
+        case WM_MOUSEWHEEL:
+            if (!pThis->showing_log && pThis->total_pages > 1) {
+                int wheel_delta = GET_WHEEL_DELTA_WPARAM(wParam);
+                if (wheel_delta > 0) {
+                    pThis->ChangePage(-1);
+                } else if (wheel_delta < 0) {
+                    pThis->ChangePage(1);
+                }
                 return 0;
             }
             break;

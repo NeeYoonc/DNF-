@@ -17,10 +17,13 @@
 #define IDC_BTN_CANCEL     1003
 #define IDC_STATIC_LABEL   1004  // "下载地址:" 标签
 #define IDC_EDIT_DOWNLOAD  1005  // 下载地址文本框（可复制）
-#define IDC_SERVER_BTN_BASE 2000  // 服务器按钮ID起始值 (2000+索引)
 #define IDC_BTN_SHOW_LOG   1006  // "查看日志" 按钮
 #define IDC_EDIT_LOG       1007  // 日志文本框
 #define IDC_BTN_BACK       1008  // "返回" 按钮
+#define IDC_BTN_PREV_PAGE  1009  // 上一页
+#define IDC_STATIC_PAGE_INFO 1010  // 页码信息
+#define IDC_BTN_NEXT_PAGE  1011  // 下一页
+#define IDC_SERVER_BTN_BASE 2000  // 服务器按钮ID起始值 (2000+索引)
 
 // 服务器选择器类
 class ServerSelectorGUI {
@@ -53,6 +56,8 @@ private:
     int selected_index;
     bool user_confirmed;
     std::vector<HWND> server_buttons;  // 存储服务器按钮句柄
+    int current_page;  // 当前页（从0开始）
+    int total_pages;  // 总页数
     bool showing_log;  // 是否显示日志页面
     bool is_connected;  // 是否已连接
     bool dialog_should_close;  // 对话框是否应该关闭
@@ -86,6 +91,11 @@ private:
 
     // 填充服务器列表
     void PopulateServerList(int last_server_id);
+    void UpdateServerButtonLayout();  // 刷新当前页按钮位置
+    void ConfigureServerScrollBar();  // 兼容旧接口（不使用滚动条）
+    void ScrollServerList(int delta);  // 兼容旧接口（分页切换）
+    void UpdatePaginationControls();  // 更新分页控件状态
+    void ChangePage(int delta);  // 切换页码
 
     // 更新服务器详情显示
     void UpdateServerInfo(int index);
