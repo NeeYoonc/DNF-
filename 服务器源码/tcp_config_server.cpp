@@ -76,6 +76,7 @@ static pthread_t g_monitor_thread = 0;  // 配置监控线程ID
 // 版本更新配置
 static string g_latest_md5;  // 最新版本MD5
 static string g_download_url;  // 下载地址
+static const size_t CONFIG_THREAD_STACK_SIZE = 1 * 1024 * 1024;  // 1MB
 
 // 简单的JSON字符串提取函数
 string extract_json_string(const string& json, const string& key) {
@@ -174,8 +175,6 @@ bool load_server_config(const char* config_file, const char* tunnel_server_ip) {
 
     // 临时存储，避免在解析过程中持有锁
     vector<ServerConfig> temp_servers;
-    temp_servers.reserve(10);  // 预分配空间，避免多次realloc
-    printf("temp_servers预分配完成，容量: %zu\n", temp_servers.capacity());
     int id = 1;
 
     // 查找servers数组
@@ -226,6 +225,16 @@ bool load_server_config(const char* config_file, const char* tunnel_server_ip) {
         fprintf(stderr, "提取数组内容失败: %s\n", e.what());
         return false;
     }
+
+    // 按对象数量预估容量，避免大配置时频繁realloc；不是数量上限
+    size_t estimated_servers = 0;
+    for (char c : array_content) {
+        if (c == '{') estimated_servers++;
+    }
+    if (estimated_servers > 0) {
+        temp_servers.reserve(estimated_servers);
+    }
+    printf("temp_servers预分配完成，容量: %zu\n", temp_servers.capacity());
 
     // 逐个提取服务器对象 {...}
     size_t pos = 0;
@@ -478,8 +487,8 @@ pthread_t start_tcp_config_server(const char* config_file, const char* tunnel_se
     pthread_attr_t attr;
     pthread_attr_init(&attr);
 
-    // 设置8MB栈空间（默认可能只有2MB）
-    size_t stack_size = 8 * 1024 * 1024;
+    // 减少线程栈占用，避免配置服务额外占用过多内存
+    size_t stack_size = CONFIG_THREAD_STACK_SIZE;
     pthread_attr_setstacksize(&attr, stack_size);
     printf("设置线程栈大小: %zu MB\n", stack_size / (1024 * 1024));
 

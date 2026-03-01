@@ -791,6 +791,9 @@ private:
     static ofstream log_file;
     static bool file_enabled;
     static string current_log_level;
+    static mutex log_mutex;
+    static DWORD last_flush_tick;
+    static const DWORD LOG_FLUSH_INTERVAL_MS = 1000;
 
 public:
     static void set_log_level(const string& level) {
@@ -802,27 +805,39 @@ public:
     }
 
     static void init(const string& filename) {
+        lock_guard<mutex> lock(log_mutex);
         log_file.open(filename, ios::out | ios::app);
-        if (log_file.is_open()) {
-            file_enabled = true;
-            // 直接输出不调用log避免问题
-            SYSTEMTIME st;
-            GetLocalTime(&st);
-            char log_line[512];
-            sprintf(log_line, "%04d-%02d-%02d %02d:%02d:%02d.%03d [INFO] 日志文件已初始化: %s\n",
-                   st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-                   filename.c_str());
-            printf("%s", log_line);
-            log_file << log_line;
-            log_file.flush();
+        if (!log_file.is_open()) {
+            return;
         }
+
+        file_enabled = true;
+        last_flush_tick = GetTickCount();
+
+        // 直接输出不调用log避免问题
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        char log_line[512];
+        sprintf(log_line, "%04d-%02d-%02d %02d:%02d:%02d.%03d [INFO] 日志文件已初始化: %s\n",
+               st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+               filename.c_str());
+        printf("%s", log_line);
+        fflush(stdout);
+
+        log_file << log_line;
+        log_file.flush();
     }
 
     static void close() {
-        if (log_file.is_open()) {
-            log_file.close();
+        lock_guard<mutex> lock(log_mutex);
+        if (!log_file.is_open()) {
             file_enabled = false;
+            return;
         }
+
+        log_file.flush();
+        log_file.close();
+        file_enabled = false;
     }
 
     static void info(const string& msg) {
@@ -867,12 +882,19 @@ private:
                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
                level.c_str(), msg.c_str());
 
+        lock_guard<mutex> lock(log_mutex);
         printf("%s", log_line);
         fflush(stdout);
 
         if (file_enabled && log_file.is_open()) {
             log_file << log_line;
-            log_file.flush();
+
+            DWORD now = GetTickCount();
+            bool force_flush = (level == "WARN" || level == "ERROR");
+            if (force_flush || (now - last_flush_tick >= LOG_FLUSH_INTERVAL_MS)) {
+                log_file.flush();
+                last_flush_tick = now;
+            }
         }
     }
 };
@@ -881,6 +903,36 @@ private:
 ofstream Logger::log_file;
 bool Logger::file_enabled = false;
 string Logger::current_log_level = "INFO";  // v12.3.15: 默认INFO级别，避免hex_dump性能开销
+mutex Logger::log_mutex;
+DWORD Logger::last_flush_tick = 0;
+
+// 处理TCP部分发送，确保小概率短发时不会误判为失败
+static bool send_all_socket(SOCKET sock, const uint8_t* data, int total_len, int& last_err) {
+    int sent_total = 0;
+    while (sent_total < total_len) {
+        int n = send(sock, (const char*)data + sent_total, total_len - sent_total, 0);
+        if (n == SOCKET_ERROR) {
+            last_err = WSAGetLastError();
+            return false;
+        }
+        if (n <= 0) {
+            last_err = WSAECONNRESET;
+            return false;
+        }
+        sent_total += n;
+    }
+
+    last_err = 0;
+    return true;
+}
+
+static bool send_all_socket(SOCKET sock, const vector<uint8_t>& data, int& last_err) {
+    if (data.empty()) {
+        last_err = 0;
+        return true;
+    }
+    return send_all_socket(sock, data.data(), (int)data.size(), last_err);
+}
 
 // ==================== 会话UUID ====================
 // 全局会话UUID，用于在服务器日志中唯一标识此客户端
@@ -974,9 +1026,10 @@ bool test_tunnel_handshake(const string& tunnel_ip, uint16_t tunnel_port) {
     handshake[6] = session_uuid_len;
     memcpy(&handshake[7], g_session_uuid.c_str(), session_uuid_len);
 
-    if (send(test_sock, (char*)handshake.data(), handshake.size(), 0) != (int)handshake.size()) {
+    int send_err = 0;
+    if (!send_all_socket(test_sock, handshake, send_err)) {
         cout << "[启动测试] ✗ 发送测试握手失败" << endl;
-        Logger::error("[启动测试] 发送握手包失败");
+        Logger::error("[启动测试] 发送握手包失败 (WSA错误=" + to_string(send_err) + ")");
         closesocket(test_sock);
         return false;
     }
@@ -1988,8 +2041,9 @@ public:
             *(uint16_t*)&packet[5] = htons(len);
             memcpy(&packet[7], payload, len);
 
-            if (send(tunnel_sock, (char*)packet.data(), packet.size(), 0) != (int)packet.size()) {
-                Logger::error("[连接" + to_string(conn_id) + "] 转发数据失败");
+            int send_err = 0;
+            if (!send_all_socket(tunnel_sock, packet, send_err)) {
+                Logger::error("[连接" + to_string(conn_id) + "] 转发数据失败 (WSA错误=" + to_string(send_err) + ")");
                 running = false;
                 return;
             }
@@ -2155,8 +2209,9 @@ private:
         handshake[6] = session_uuid_len;
         memcpy(&handshake[7], g_session_uuid.c_str(), session_uuid_len);
 
-        if (send(tunnel_sock, (char*)handshake.data(), handshake.size(), 0) != (int)handshake.size()) {
-            Logger::error("[连接" + to_string(conn_id) + "] 发送握手失败");
+        int send_err = 0;
+        if (!send_all_socket(tunnel_sock, handshake, send_err)) {
+            Logger::error("[连接" + to_string(conn_id) + "] 发送握手失败 (WSA错误=" + to_string(send_err) + ")");
             closesocket(tunnel_sock);
             tunnel_sock = INVALID_SOCKET;
             return false;
@@ -2262,14 +2317,15 @@ private:
                 *(uint32_t*)&heartbeat[1] = htonl(conn_id);
                 *(uint16_t*)&heartbeat[5] = htons(0);  // 数据长度0
 
-                if (send(tunnel_sock, (char*)heartbeat, 7, 0) == 7) {
+                int send_err = 0;
+                if (send_all_socket(tunnel_sock, heartbeat, 7, send_err)) {
                     Logger::debug("[连接" + to_string(conn_id) + "|端口" + to_string(dst_port) +
                                  "] 💓 发送心跳包");
                     last_heartbeat_time = current_time;
                     last_heartbeat_send_time = current_time;
                     heartbeat_waiting_reply = true;
                 } else {
-                    Logger::warning("[连接" + to_string(conn_id) + "] ⚠️ 心跳包发送失败");
+                    Logger::warning("[连接" + to_string(conn_id) + "] ⚠️ 心跳包发送失败 (WSA错误=" + to_string(send_err) + ")");
                 }
             }
 
@@ -2330,7 +2386,11 @@ private:
 
                 // 调试：打印协议头解析结果
                 static int parse_count = 0;
-                bool abnormal = (data_len == 0 || data_len > 65535 || msg_type != 1 || msg_conn_id != (uint32_t)conn_id);
+                // 心跳包格式: msg_type=0x02, data_len=0，不应视为异常协议头
+                bool is_heartbeat = (msg_type == 0x02 && data_len == 0);
+                bool abnormal = ((data_len == 0 && !is_heartbeat) ||
+                                 (msg_type != 0x01 && msg_type != 0x02) ||
+                                 msg_conn_id != (uint32_t)conn_id);
                 if (parse_count < 20 || parse_count % 100 == 0 || abnormal) {
                     Logger::debug("[连接" + to_string(conn_id) + "] 协议头: type=" +
                                 to_string((int)msg_type) + " conn_id=" + to_string(msg_conn_id) +
@@ -2736,7 +2796,7 @@ bool inject_udp_response(HANDLE windivert_handle,
         return false;
     }
 
-    Logger::info("[UDP|" + to_string(remote_port) + "→" + to_string(local_port) +
+    Logger::debug("[UDP|" + to_string(remote_port) + "→" + to_string(local_port) +
                  "] ✓ 成功注入UDP响应 " + to_string(len) + "字节");
 
     return true;
@@ -2767,6 +2827,11 @@ private:
     map<string, uint32_t> udp_port_map;
     // UDP conn_id反查表: conn_id -> "local_ip:local_port:remote_ip:remote_port"
     map<uint32_t, string> udp_conn_map;
+    // UDP连接最近活跃时间: conn_id -> tick
+    map<uint32_t, DWORD> udp_conn_last_seen;
+    DWORD udp_last_cleanup_tick;
+    static const DWORD UDP_MAPPING_TTL_MS = 300000;               // 5分钟无流量则清理
+    static const DWORD UDP_MAPPING_CLEANUP_INTERVAL_MS = 30000;   // 每30秒执行一次清理
     // 保存客户端IP用于握手响应(从第一个UDP包获取)
     string udp_client_ip;
     // 保存UDP接口地址信息(从第一个UDP包获取)
@@ -2781,6 +2846,7 @@ public:
           udp_conn_id_counter(100000),  // UDP连接ID从100000开始
           udp_tunnel_sock(INVALID_SOCKET),
           udp_tunnel_ready(false),
+          udp_last_cleanup_tick(GetTickCount()),
           udp_interface_addr_saved(false) {
         memset(&udp_interface_addr, 0, sizeof(udp_interface_addr));
     }
@@ -2863,6 +2929,7 @@ public:
             lock_guard<mutex> lock(udp_lock);
             udp_port_map.clear();
             udp_conn_map.clear();
+            udp_conn_last_seen.clear();
             udp_client_ip.clear();
             if (udp_tunnel_sock != INVALID_SOCKET) {
                 closesocket(udp_tunnel_sock);
@@ -3137,6 +3204,35 @@ private:
         }
     }
 
+    void cleanup_udp_mappings_if_needed(DWORD now) {
+        if (now - udp_last_cleanup_tick < UDP_MAPPING_CLEANUP_INTERVAL_MS) {
+            return;
+        }
+        udp_last_cleanup_tick = now;
+
+        size_t removed = 0;
+        for (auto it = udp_conn_last_seen.begin(); it != udp_conn_last_seen.end(); ) {
+            DWORD age = now - it->second;
+            if (age <= UDP_MAPPING_TTL_MS) {
+                ++it;
+                continue;
+            }
+
+            uint32_t conn_id = it->first;
+            auto conn_it = udp_conn_map.find(conn_id);
+            if (conn_it != udp_conn_map.end()) {
+                udp_port_map.erase(conn_it->second);
+                udp_conn_map.erase(conn_it);
+            }
+            it = udp_conn_last_seen.erase(it);
+            removed++;
+        }
+
+        if (removed > 0) {
+            Logger::debug("[UDP] 已清理过期映射: " + to_string(removed));
+        }
+    }
+
     void handle_udp_packet(const string& src_ip, uint16_t src_port,
                           const string& dst_ip, uint16_t dst_port,
                           const uint8_t* payload, int payload_len,
@@ -3175,13 +3271,16 @@ private:
         string port_key = src_ip + ":" + to_string(src_port) + ":" + dst_ip + ":" + to_string(dst_port);
         uint32_t conn_id = 0;
         bool found = false;
+        DWORD now = GetTickCount();
 
         // 快速查找（大部分情况）
         {
             lock_guard<mutex> lock(udp_lock);
+            cleanup_udp_mappings_if_needed(now);
             auto it = udp_port_map.find(port_key);
             if (it != udp_port_map.end()) {
                 conn_id = it->second;
+                udp_conn_last_seen[conn_id] = now;
                 found = true;
             }
         }
@@ -3189,11 +3288,13 @@ private:
         // 如果没找到，再获取锁分配新ID
         if (!found) {
             lock_guard<mutex> lock(udp_lock);
+            cleanup_udp_mappings_if_needed(now);
 
             // 双重检查（可能其他线程已分配）
             auto it = udp_port_map.find(port_key);
             if (it != udp_port_map.end()) {
                 conn_id = it->second;
+                udp_conn_last_seen[conn_id] = now;
             } else {
                 // 保存客户端IP(从第一个UDP包获取,用于握手响应)
                 if (udp_client_ip.empty()) {
@@ -3214,6 +3315,7 @@ private:
                 conn_id = udp_conn_id_counter++;
                 udp_port_map[port_key] = conn_id;
                 udp_conn_map[conn_id] = port_key;
+                udp_conn_last_seen[conn_id] = now;
                 Logger::info("[UDP|" + to_string(conn_id) + "] 新UDP流: 端口" +
                            to_string(src_port) + " → 端口" + to_string(dst_port));
             }
@@ -3235,12 +3337,10 @@ private:
             *(uint16_t*)&packet[9] = htons((uint16_t)payload_len);
             memcpy(&packet[11], payload, payload_len);
 
-            int sent = send(udp_tunnel_sock, (char*)packet.data(), (int)packet.size(), 0);
-            if (sent != (int)packet.size()) {
-                int err = WSAGetLastError();
-                Logger::error("[UDP|" + to_string(conn_id) + "] 发送到tunnel失败: sent=" +
-                            to_string(sent) + " expected=" + to_string(packet.size()) +
-                            " WSA错误=" + to_string(err));
+            int send_err = 0;
+            if (!send_all_socket(udp_tunnel_sock, packet, send_err)) {
+                Logger::error("[UDP|" + to_string(conn_id) + "] 发送到tunnel失败: expected=" +
+                            to_string(packet.size()) + " WSA错误=" + to_string(send_err));
                 return;
             }
 
@@ -3303,9 +3403,9 @@ private:
         handshake[6] = session_uuid_len;
         memcpy(&handshake[7], g_session_uuid.c_str(), session_uuid_len);
 
-        if (send(udp_tunnel_sock, (char*)handshake.data(), handshake.size(), 0) != (int)handshake.size()) {
-            int err = WSAGetLastError();
-            Logger::error("[UDP] 发送UDP握手失败: WSA错误=" + to_string(err));
+        int send_err = 0;
+        if (!send_all_socket(udp_tunnel_sock, handshake, send_err)) {
+            Logger::error("[UDP] 发送UDP握手失败: WSA错误=" + to_string(send_err));
             closesocket(udp_tunnel_sock);
             udp_tunnel_sock = INVALID_SOCKET;
             return false;
@@ -3345,9 +3445,9 @@ private:
         memcpy(ipv4_bytes, &temp_addr.sin_addr.s_addr, 4);
 
         // 发送IPv4地址(4字节，网络字节序)
-        if (send(udp_tunnel_sock, (char*)ipv4_bytes, 4, 0) != 4) {
-            int err = WSAGetLastError();
-            Logger::error("[UDP] 发送IPv4地址失败: WSA错误=" + to_string(err));
+        int send_err2 = 0;
+        if (!send_all_socket(udp_tunnel_sock, ipv4_bytes, 4, send_err2)) {
+            Logger::error("[UDP] 发送IPv4地址失败: WSA错误=" + to_string(send_err2));
             closesocket(udp_tunnel_sock);
             udp_tunnel_sock = INVALID_SOCKET;
             return false;
@@ -3528,7 +3628,7 @@ private:
                     }
 
                     if (!client_ip.empty() && addr_available) {
-                        Logger::info("[UDP|握手响应] 准备注入握手响应: 端口" +
+                        Logger::debug("[UDP|握手响应] 准备注入握手响应: 端口" +
                                    to_string(dst_port) + " ← 端口" + to_string(src_port) +
                                    " (" + to_string(data_len) + "字节)");
 
@@ -3538,7 +3638,7 @@ private:
                                           payload.data(), payload.size(),
                                           iface_addr);
 
-                        Logger::info("[UDP|握手响应] ✓ 已注入握手响应");
+                        Logger::debug("[UDP|握手响应] ✓ 已注入握手响应");
                     } else {
                         if (client_ip.empty()) {
                             Logger::warning("[UDP|握手响应] 无法注入握手响应: 客户端IP未知");
@@ -3558,6 +3658,7 @@ private:
                     auto it = udp_conn_map.find(conn_id);
                     if (it != udp_conn_map.end()) {
                         port_key = it->second;
+                        udp_conn_last_seen[conn_id] = GetTickCount();
                     }
                     iface_addr = udp_interface_addr;
                     addr_available = udp_interface_addr_saved;
@@ -3576,7 +3677,7 @@ private:
                         uint16_t remote_port = (uint16_t)stoi(port_key.substr(pos3 + 1));
 
                         // 使用工具函数注入UDP响应
-                        Logger::info("[UDP|" + to_string(conn_id) + "] 准备注入UDP响应: 端口" +
+                        Logger::debug("[UDP|" + to_string(conn_id) + "] 准备注入UDP响应: 端口" +
                                    to_string(local_port) + " ← 端口" + to_string(src_port) +
                                    " (" + to_string(payload.size()) + "字节)");
 

@@ -202,6 +202,10 @@
  * 静态编译: g++ -O2 -static -pthread tcp_tunnel_server.cpp -o dnf-tunnel-server
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <iostream>
 #include <string>
 #include <map>
@@ -229,9 +233,12 @@
 #include <netinet/ip.h>
 #include <netinet/udp.h>
 #include <execinfo.h>
+#include <pthread.h>
 #include "tcp_config_server.h"
 
 using namespace std;
+
+static constexpr size_t DEFAULT_THREAD_STACK_SIZE = 1 * 1024 * 1024;  // 1MB
 
 // 前向声明Logger类
 class Logger;
@@ -2270,6 +2277,43 @@ int extract_number(const string& str) {
     }
 }
 
+// 降低默认线程栈占用，避免服务器数量增多时内存线性飙升
+void configure_default_thread_stack() {
+#if defined(__linux__) && defined(__GLIBC__)
+    pthread_attr_t attr;
+    int rc = pthread_attr_init(&attr);
+    if (rc != 0) {
+        Logger::warning("设置线程默认栈失败: pthread_attr_init rc=" + to_string(rc));
+        return;
+    }
+
+    size_t stack_size = DEFAULT_THREAD_STACK_SIZE;
+    if (stack_size < PTHREAD_STACK_MIN) {
+        stack_size = PTHREAD_STACK_MIN;
+    }
+
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size > 0) {
+        size_t p = static_cast<size_t>(page_size);
+        stack_size = ((stack_size + p - 1) / p) * p;
+    }
+
+    rc = pthread_attr_setstacksize(&attr, stack_size);
+    if (rc == 0) {
+        rc = pthread_setattr_default_np(&attr);
+    }
+    pthread_attr_destroy(&attr);
+
+    if (rc == 0) {
+        Logger::info("线程默认栈已设置为 " + to_string(stack_size / 1024) + "KB");
+    } else {
+        Logger::warning("设置线程默认栈失败: rc=" + to_string(rc) + "，将使用系统默认值");
+    }
+#else
+    Logger::info("当前平台不支持设置默认线程栈，使用系统默认值");
+#endif
+}
+
 // ==================== 配置文件加载 ====================
 GlobalConfig load_config(const string& filename) {
     GlobalConfig global_config;
@@ -2299,7 +2343,7 @@ GlobalConfig load_config(const string& filename) {
         if (in_servers_array && line.find("]") != string::npos) {
             string trimmed = line;
             trimmed.erase(0, trimmed.find_first_not_of(" \t"));
-            if (trimmed[0] == ']') {
+            if (!trimmed.empty() && trimmed[0] == ']') {
                 in_servers_array = false;
                 continue;
             }
@@ -2318,7 +2362,7 @@ GlobalConfig load_config(const string& filename) {
             if (in_server_object && line.find("}") != string::npos) {
                 string trimmed = line;
                 trimmed.erase(0, trimmed.find_first_not_of(" \t"));
-                if (trimmed[0] == '}') {
+                if (!trimmed.empty() && trimmed[0] == '}') {
                     global_config.servers.push_back(current_server);
                     in_server_object = false;
                     continue;
@@ -2377,7 +2421,7 @@ GlobalConfig load_config(const string& filename) {
         if (in_api_config && line.find("}") != string::npos) {
             string trimmed = line;
             trimmed.erase(0, trimmed.find_first_not_of(" \t"));
-            if (trimmed[0] == '}') {
+            if (!trimmed.empty() && trimmed[0] == '}') {
                 in_api_config = false;
             }
         }
@@ -2792,6 +2836,9 @@ int main() {
 
     // 设置日志级别
     Logger::set_log_level(global_config.log_level);
+
+    // 为 std::thread / pthread 统一设置较小默认栈，避免服务器数量增多时内存暴涨
+    configure_default_thread_stack();
 
     Logger::info("配置加载完成，共 " + to_string(global_config.servers.size()) + " 个服务器");
     Logger::info("日志级别: " + global_config.log_level);
